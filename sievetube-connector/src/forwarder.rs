@@ -1,0 +1,129 @@
+use std::net::SocketAddr;
+use tokio::net::TcpStream;
+use tokio::net::UdpSocket;
+
+use sievetube_common::config::Target;
+use sievetube_common::metrics;
+
+/// Forward traffic between a QUIC bidirectional stream and a local TCP target.
+///
+/// Returns (bytes_from_client, bytes_to_client).
+pub async fn forward_tcp(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    target_addr: SocketAddr,
+    tunnel_id: &str,
+    hostname: &str,
+) -> anyhow::Result<(u64, u64)> {
+    let mut local = TcpStream::connect(target_addr).await.map_err(|e| {
+        anyhow::anyhow!(
+            "failed to connect to local target {}: {}",
+            target_addr,
+            e
+        )
+    })?;
+
+    let (mut local_read, mut local_write) = local.split();
+
+    use tokio::io::AsyncWriteExt;
+
+    // Bidirectional copy with half-close: when one direction ends,
+    // shut down the corresponding write side to propagate EOF.
+    let quic_to_local = async {
+        let n = tokio::io::copy(&mut recv, &mut local_write).await.unwrap_or(0);
+        let _ = local_write.shutdown().await;
+        n
+    };
+    let local_to_quic = async {
+        let n = tokio::io::copy(&mut local_read, &mut send).await.unwrap_or(0);
+        let _ = send.shutdown().await;
+        n
+    };
+
+    let (bytes_in, bytes_out) = tokio::join!(quic_to_local, local_to_quic);
+
+    let m = metrics::global();
+    m.bytes_transferred_total
+        .with_label_values(&["in", "tcp"])
+        .inc_by(bytes_in as f64);
+    m.bytes_transferred_total
+        .with_label_values(&["out", "tcp"])
+        .inc_by(bytes_out as f64);
+
+    tracing::debug!(
+        tunnel_id,
+        hostname,
+        bytes_in,
+        bytes_out,
+        "tcp tunnel closed"
+    );
+
+    Ok((bytes_in, bytes_out))
+}
+
+/// Send an HTTP status response over the QUIC send stream (for http_status targets).
+pub async fn respond_http_status(
+    mut send: quinn::SendStream,
+    status: u16,
+) -> anyhow::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    send.write_all(response.as_bytes()).await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// Forward a single UDP datagram to the local target and return any reply.
+pub async fn forward_udp_datagram(
+    payload: &[u8],
+    target_addr: SocketAddr,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.send_to(payload, target_addr).await?;
+
+    // Wait for a reply with a short timeout
+    let mut buf = vec![0u8; 65535];
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.recv(&mut buf),
+    )
+    .await
+    {
+        Ok(Ok(n)) => {
+            buf.truncate(n);
+            Ok(Some(buf))
+        }
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Ok(None), // timeout — no reply
+    }
+}
+
+/// Dispatch an incoming QUIC bidi stream to the appropriate forwarder.
+pub async fn handle_stream(
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    target: Target,
+    tunnel_id: String,
+    hostname: String,
+) {
+    match target {
+        Target::Address(addr) => {
+            if let Err(e) = forward_tcp(send, recv, addr, &tunnel_id, &hostname).await {
+                tracing::warn!(tunnel_id, hostname, error = %e, "tcp forward error");
+            }
+        }
+        Target::HttpStatus(status) => {
+            if let Err(e) = respond_http_status(send, status).await {
+                tracing::warn!(tunnel_id, hostname, error = %e, "http status response error");
+            }
+        }
+    }
+}

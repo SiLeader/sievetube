@@ -1,0 +1,45 @@
+# Sieve Tube Connector Configuration
+#
+# Start the connector:
+#   sievetube-connector /path/to/config.toml
+
+[auth]
+# JWT token signed with the same secret as the Edge's jwt_secret.
+# Claims must include: sub (tenant_id), hostnames (list of hostnames you own), exp, iat.
+token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+
+[network]
+# List of Edge server addresses (host:port).
+# The Connector will establish a QUIC connection to ALL servers simultaneously.
+public_servers = [
+    "pub1.sieve-tube.example.com:4433",
+    "pub2.sieve-tube.example.com:4433",
+]
+
+# Traffic forwarding rules (Ingress)
+# Rules are evaluated top-to-bottom; the first match wins.
+
+[[ingress]]
+hostname = "web.example.com"
+protocol = "http"
+target = "127.0.0.1:8080"
+
+[[ingress]]
+hostname = "ssh.example.com"
+protocol = "tcp"
+target = "127.0.0.1:22"
+
+[[ingress]]
+hostname = "game.example.com"
+protocol = "udp"
+target = "127.0.0.1:19132"
+
+[[ingress]]
+# Catch-all: returns 404 for any unmatched hostname.
+# This rule must be last.
+target = "http_status:404"
+
+# Optional: Valkey connection for heartbeat / connector state visibility.
+# [valkey]
+# url = "redis://127.0.0.1:6379"
+# heartbeat_interval_secs = 15

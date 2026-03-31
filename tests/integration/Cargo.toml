@@ -1,0 +1,17 @@
+[package]
+name = "sievetube-integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# This crate only contains integration tests.
+# Before running: cargo build -p sievetube-edge -p sievetube-connector
+# To run: cargo test -p sievetube-integration-tests
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+sievetube-common = { path = "../../sievetube-common" }
+tokio = { workspace = true }
+anyhow = { workspace = true }

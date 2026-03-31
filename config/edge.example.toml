@@ -1,0 +1,39 @@
+# Sieve Tube Edge Configuration
+
+[server]
+# Address where Connectors connect via QUIC (must be reachable from the internet)
+quic_listen = "0.0.0.0:4433"
+# Public HTTP listener (plain HTTP traffic from end users)
+http_listen = "0.0.0.0:80"
+# Public HTTPS listener (TLS-terminated traffic from end users)
+https_listen = "0.0.0.0:443"
+# Raw TCP listeners (optional). Each entry maps a listen address to a hostname.
+# Since raw TCP has no Host header, the hostname is configured per listen port.
+# [[server.tcp_listen]]
+# addr = "0.0.0.0:2222"
+# hostname = "ssh.example.com"
+
+# UDP listeners (optional). Same addr→hostname mapping.
+# [[server.udp_listen]]
+# addr = "0.0.0.0:19132"
+# hostname = "game.example.com"
+# Internal health check and Prometheus metrics endpoint
+health_listen = "127.0.0.1:9090"
+
+[auth]
+# HMAC-SHA256 secret used to verify Connector JWTs.
+# Must match the secret used to sign the Connector's token.
+jwt_secret = "change-me-to-a-long-random-secret"
+
+[tls]
+# Directory containing TLS certificate pairs for public HTTPS.
+# Each hostname needs two files:
+#   <hostname>.crt  — PEM-encoded certificate chain
+#   <hostname>.key  — PEM-encoded private key
+# Example: web.example.com.crt + web.example.com.key
+cert_dir = "/etc/sievetube/certs"
+
+# Optional: Valkey/Redis for control-plane state management (hostname ownership,
+# connector presence). If omitted, the edge runs without state management.
+# [valkey]
+# url = "redis://127.0.0.1:6379"

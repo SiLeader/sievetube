@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "sievetube-common",
+    "sievetube-edge",
+    "sievetube-connector",
+    "tests/integration",
+]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# QUIC
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+
+# Serialization & config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Auth
+jsonwebtoken = "9"
+
+# Valkey/Redis
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+
+# HTTP
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus = { version = "0.13", features = ["process"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+dashmap = "6"
+arc-swap = "1"
+tokio-rustls = "0.26"
