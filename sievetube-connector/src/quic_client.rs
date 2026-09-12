@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use quinn::rustls;
 use sievetube_common::config::{Protocol, Target};
+use sievetube_common::hostname;
 use sievetube_common::protocol::{
-    self, AuthRequest, DatagramHeader, Message, ALPN_PROTOCOL,
+    self, AuthRequest, DatagramHeader, Message, ServiceAdvertisement, ALPN_PROTOCOL,
 };
 
 use crate::ingress::IngressMatcher;
@@ -12,20 +13,60 @@ use crate::ingress::IngressMatcher;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// Build a QUIC client endpoint that skips server certificate verification.
-/// This is acceptable for the internal tunnel — the JWT provides auth.
-fn build_endpoint() -> anyhow::Result<quinn::Endpoint> {
-    let crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth();
+/// How the Edge's QUIC certificate is checked.
+pub enum EdgeVerification {
+    /// Verify against a CA bundle (recommended)
+    Ca(rustls::RootCertStore),
+    /// Accept only these certificate fingerprints
+    Pinned(Vec<String>),
+    /// No verification; only for migrating existing deployments
+    Skip,
+}
 
-    let mut crypto = crypto;
+impl EdgeVerification {
+    /// Build from the `[network]` settings, reading the CA bundle if configured.
+    pub fn from_config(ca_cert: Option<&str>, pins: &[String]) -> anyhow::Result<Self> {
+        if let Some(path) = ca_cert {
+            let pem =
+                std::fs::read(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+                roots.add(cert?)?;
+            }
+            if roots.is_empty() {
+                anyhow::bail!("no certificate found in {path}");
+            }
+            return Ok(EdgeVerification::Ca(roots));
+        }
+        if !pins.is_empty() {
+            return Ok(EdgeVerification::Pinned(
+                pins.iter()
+                    .map(|pin| pin.trim().to_ascii_lowercase())
+                    .collect(),
+            ));
+        }
+        Ok(EdgeVerification::Skip)
+    }
+}
+
+/// Build a QUIC client endpoint for connecting to Edges.
+fn build_endpoint(verification: EdgeVerification) -> anyhow::Result<quinn::Endpoint> {
+    let builder = rustls::ClientConfig::builder();
+    let mut crypto = match verification {
+        EdgeVerification::Ca(roots) => builder.with_root_certificates(roots).with_no_client_auth(),
+        EdgeVerification::Pinned(pins) => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedServerVerification::new(pins)))
+            .with_no_client_auth(),
+        EdgeVerification::Skip => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth(),
+    };
     crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
-    let quic_cfg =
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-            .map_err(|e| anyhow::anyhow!("QuicClientConfig error: {e}"))?;
+    let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+        .map_err(|e| anyhow::anyhow!("QuicClientConfig error: {e}"))?;
 
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(65535));
@@ -41,14 +82,33 @@ fn build_endpoint() -> anyhow::Result<quinn::Endpoint> {
 /// Connect to a single Edge server, authenticate with JWT, and serve streams.
 ///
 /// This function runs a reconnect loop with exponential backoff.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_connection(
     server_addr_str: String,
     jwt: String,
+    services: Option<Arc<Vec<ServiceAdvertisement>>>,
     matcher: Arc<IngressMatcher>,
     tunnel_id: String,
+    verification: EdgeVerification,
+    configured_server_name: Option<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let endpoint = match build_endpoint() {
+    let server_name = match tls_server_name(&server_addr_str, configured_server_name.as_deref()) {
+        Ok(name) => name,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot determine the TLS server name of the edge");
+            return;
+        }
+    };
+    if matches!(verification, EdgeVerification::Ca(_))
+        && server_name.parse::<std::net::IpAddr>().is_ok()
+    {
+        tracing::warn!(
+            server = %server_addr_str,
+            "the edge address is an IP literal, so its certificate needs a matching IP SAN; set [network] edge_server_name to verify against a hostname instead"
+        );
+    }
+    let endpoint = match build_endpoint(verification) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "failed to build QUIC endpoint");
@@ -66,7 +126,9 @@ pub async fn run_connection(
         match try_connect_and_serve(
             &endpoint,
             &server_addr_str,
+            &server_name,
             &jwt,
+            services.as_deref(),
             matcher.clone(),
             &tunnel_id,
             shutdown.clone(),
@@ -96,10 +158,24 @@ pub async fn run_connection(
     }
 }
 
+/// TLS server name for an Edge address: the configured override, otherwise the
+/// host part of the address. Splitting on `:` would mangle every IPv6 literal.
+fn tls_server_name(server_addr_str: &str, configured: Option<&str>) -> anyhow::Result<String> {
+    if let Some(name) = configured {
+        return Ok(name.to_string());
+    }
+    let (host, _port) = hostname::split_authority(server_addr_str)
+        .map_err(|e| anyhow::anyhow!("invalid server address {server_addr_str}: {e}"))?;
+    Ok(host.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn try_connect_and_serve(
     endpoint: &quinn::Endpoint,
     server_addr_str: &str,
+    server_name: &str,
     jwt: &str,
+    services: Option<&Vec<ServiceAdvertisement>>,
     matcher: Arc<IngressMatcher>,
     tunnel_id: &str,
     shutdown: tokio::sync::watch::Receiver<bool>,
@@ -111,16 +187,10 @@ async fn try_connect_and_serve(
         .next()
         .ok_or_else(|| anyhow::anyhow!("no addresses for {server_addr_str}"))?;
 
-    let server_name = server_addr_str
-        .split(':')
-        .next()
-        .unwrap_or(server_addr_str)
-        .to_string();
-
-    tracing::info!(server = %server_addr_str, "connecting to edge");
+    tracing::info!(server = %server_addr_str, server_name, "connecting to edge");
 
     let connection = endpoint
-        .connect(server_addr, &server_name)?
+        .connect(server_addr, server_name)?
         .await
         .map_err(|e| anyhow::anyhow!("QUIC connect failed: {e}"))?;
 
@@ -132,6 +202,7 @@ async fn try_connect_and_serve(
         &mut auth_send,
         &Message::AuthRequest(AuthRequest {
             jwt: jwt.to_string(),
+            services: services.cloned(),
         }),
     )
     .await?;
@@ -266,6 +337,81 @@ async fn serve_streams(
     }
 }
 
+/// Accepts only certificates whose SHA-256 fingerprint is pinned. Useful when the
+/// Edge presents a self-signed certificate.
+#[derive(Debug)]
+struct PinnedServerVerification {
+    pins: Vec<String>,
+}
+
+impl PinnedServerVerification {
+    fn new(pins: Vec<String>) -> Self {
+        PinnedServerVerification { pins }
+    }
+}
+
+pub fn certificate_sha256(der: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, der)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedServerVerification {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let fingerprint = certificate_sha256(end_entity.as_ref());
+        if self.pins.iter().any(|pin| pin == &fingerprint) {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(format!(
+                "edge certificate {fingerprint} is not pinned"
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// A rustls certificate verifier that accepts any server certificate.
 /// Security note: The tunnel is authenticated by JWT, not by server TLS cert.
 #[derive(Debug)]
@@ -305,5 +451,67 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verification_mode_follows_the_configuration() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        assert!(matches!(
+            EdgeVerification::from_config(None, &[]).unwrap(),
+            EdgeVerification::Skip
+        ));
+        assert!(matches!(
+            EdgeVerification::from_config(None, &["ab".repeat(32)]).unwrap(),
+            EdgeVerification::Pinned(_)
+        ));
+        assert!(EdgeVerification::from_config(Some("/nonexistent/ca.pem"), &[]).is_err());
+    }
+
+    #[test]
+    fn server_name_handles_literals_and_overrides() {
+        assert_eq!(
+            tls_server_name("edge.example.com:4433", None).unwrap(),
+            "edge.example.com"
+        );
+        assert_eq!(
+            tls_server_name("203.0.113.5:4433", None).unwrap(),
+            "203.0.113.5"
+        );
+        // An IPv6 literal must not be cut at its first colon.
+        assert_eq!(
+            tls_server_name("[2001:db8::1]:4433", None).unwrap(),
+            "2001:db8::1"
+        );
+        assert_eq!(
+            tls_server_name("[2001:db8::1]:4433", Some("edge.example.com")).unwrap(),
+            "edge.example.com"
+        );
+        assert!(tls_server_name("2001:db8::1:4433", None).is_err());
+    }
+
+    #[test]
+    fn pinning_accepts_only_listed_fingerprints() {
+        use rustls::client::danger::ServerCertVerifier;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["edge.test".to_string()]).unwrap();
+        let der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let fingerprint = certificate_sha256(der.as_ref());
+
+        let verify = |pins: Vec<String>| {
+            PinnedServerVerification::new(pins).verify_server_cert(
+                &der,
+                &[],
+                &rustls::pki_types::ServerName::try_from("edge.test").unwrap(),
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+        };
+        assert!(verify(vec![fingerprint.clone()]).is_ok());
+        assert!(verify(vec!["00".repeat(32)]).is_err());
     }
 }

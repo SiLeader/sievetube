@@ -33,20 +33,38 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = config::ConnectorConfig::from_file(&config_path)?;
 
-    // Extract tenant_id from JWT for display (no signature verification)
-    let tunnel_id = extract_jwt_sub(&cfg.auth.token)
-        .unwrap_or_else(|| "unknown".to_string());
+    // Extract claims from JWT for display and service advertisement
+    // (no signature verification; the Edge verifies the token)
+    let claims = extract_jwt_claims(&cfg.auth.token);
+    let tunnel_id = claims
+        .as_ref()
+        .and_then(|c| c["sub"].as_str())
+        .unwrap_or("unknown")
+        .to_string();
 
     tracing::info!(tunnel_id, "connector starting");
 
     let matcher = Arc::new(IngressMatcher::new(cfg.ingress.clone()));
+    let services = claims
+        .as_ref()
+        .and_then(|c| c["hostnames"].as_array())
+        .map(|hostnames| {
+            let hostnames: Vec<String> = hostnames
+                .iter()
+                .filter_map(|h| h.as_str().map(str::to_string))
+                .collect();
+            Arc::new(matcher.services(&hostnames))
+        });
 
     // Connect to Valkey and start heartbeat (optional)
     if let Some(ref valkey_cfg) = cfg.valkey {
         let tunnel_id_clone = tunnel_id.clone();
         let url = valkey_cfg.url.clone();
         let interval = std::time::Duration::from_secs(valkey_cfg.heartbeat_interval_secs);
-        let edge_id = cfg.network.public_servers.first()
+        let edge_id = cfg
+            .network
+            .public_servers
+            .first()
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
 
@@ -65,22 +83,43 @@ async fn main() -> anyhow::Result<()> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // How the Edge's certificate is checked (CA, pinning, or not at all).
+    let verification = || {
+        quic_client::EdgeVerification::from_config(
+            cfg.network.edge_ca_cert.as_deref(),
+            &cfg.network.edge_cert_sha256,
+        )
+    };
+
     // Spawn a connection task for each public server (full-mesh topology)
     for server in &cfg.network.public_servers {
         let server = server.clone();
         let jwt = cfg.auth.token.clone();
         let matcher = matcher.clone();
+        let services = services.clone();
         let tid = tunnel_id.clone();
         let shutdown = shutdown_rx.clone();
 
+        let edge_verification = verification()?;
+        let server_name = cfg.network.edge_server_name.clone();
         tokio::spawn(async move {
-            quic_client::run_connection(server, jwt, matcher, tid, shutdown).await;
+            quic_client::run_connection(
+                server,
+                jwt,
+                services,
+                matcher,
+                tid,
+                edge_verification,
+                server_name,
+                shutdown,
+            )
+            .await;
         });
     }
 
     // Health/metrics server
-    let health_addr = std::env::var("SIEVETUBE_HEALTH_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9091".to_string());
+    let health_addr =
+        std::env::var("SIEVETUBE_HEALTH_ADDR").unwrap_or_else(|_| "127.0.0.1:9091".to_string());
     tokio::spawn(async move {
         if let Err(e) = health::serve(&health_addr).await {
             tracing::error!(error = %e, "health server failed");
@@ -97,19 +136,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Decode the `sub` claim from a JWT payload without verifying the signature.
-/// Used only for logging — not a security boundary.
-fn extract_jwt_sub(token: &str) -> Option<String> {
+/// Decode the claims from a JWT payload without verifying the signature.
+/// Used only for logging and advertisement — not a security boundary.
+fn extract_jwt_claims(token: &str) -> Option<serde_json::Value> {
     let payload_b64 = token.split('.').nth(1)?;
     let bytes = base64url_decode(payload_b64)?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    v["sub"].as_str().map(str::to_string)
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Minimal URL-safe base64 decode (no padding required).
 fn base64url_decode(input: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let lookup: [u8; 256] = {
         let mut t = [0xffu8; 256];
         for (i, &c) in TABLE.iter().enumerate() {

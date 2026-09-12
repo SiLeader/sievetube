@@ -9,15 +9,27 @@
 token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 
 [network]
-# List of Edge server addresses (host:port).
-# The Connector will establish a QUIC connection to ALL servers simultaneously.
+# Edge servers to connect to (host:port).
+# With mesh routing an Edge forwards to the Edge holding this connection, so a
+# redundant subset is enough; without it, list every Edge.
 public_servers = [
     "pub1.sieve-tube.example.com:4433",
     "pub2.sieve-tube.example.com:4433",
 ]
+# Verify the Edge's QUIC certificate against this CA bundle. The host part of
+# public_servers must match a name in the certificate.
+# edge_ca_cert = "/etc/sievetube/edge-ca.pem"
+# Server name to verify against, when the Edge is addressed by IP (an IP address
+# would otherwise have to appear in the certificate as an IP SAN).
+# edge_server_name = "edge.sieve-tube.example.com"
+# Alternatively pin the certificates (e.g. when the Edge is self-signed):
+# edge_cert_sha256 = ["0000000000000000000000000000000000000000000000000000000000000000"]
+# With neither set the certificate is not verified; only for migration.
 
 # Traffic forwarding rules (Ingress)
 # Rules are evaluated top-to-bottom; the first match wins.
+# The protocols matched here are also advertised to the Edge, so it only routes
+# traffic this Connector can actually serve.
 
 [[ingress]]
 hostname = "web.example.com"

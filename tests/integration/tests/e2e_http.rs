@@ -12,8 +12,7 @@ async fn http_tunnel_basic() {
     let http_port = helpers::find_free_port();
     let health_port = helpers::find_free_port();
 
-    let edge_cfg =
-        helpers::write_edge_config(quic_port, http_port, health_port, secret, &[]);
+    let edge_cfg = helpers::write_edge_config(quic_port, http_port, health_port, secret, &[]);
     let jwt = helpers::make_jwt(secret, "tenant-http", &[hostname]);
     let conn_cfg = helpers::write_connector_config(
         &jwt,
@@ -51,8 +50,7 @@ async fn auth_rejection_returns_502() {
     let http_port = helpers::find_free_port();
     let health_port = helpers::find_free_port();
 
-    let edge_cfg =
-        helpers::write_edge_config(quic_port, http_port, health_port, edge_secret, &[]);
+    let edge_cfg = helpers::write_edge_config(quic_port, http_port, health_port, edge_secret, &[]);
     let bad_jwt = helpers::make_jwt(wrong_secret, "bad-tenant", &[hostname]);
     let conn_cfg = helpers::write_connector_config(
         &bad_jwt,

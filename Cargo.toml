@@ -10,13 +10,16 @@ members = [
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 
 # QUIC
 quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
-rcgen = "0.13"
+rcgen = { version = "0.13", features = ["x509-parser"] }
+ring = "0.17"
+time = "0.3"
+x509-parser = "0.18"
 
 # Serialization & config
 serde = { version = "1", features = ["derive"] }
@@ -27,11 +30,12 @@ toml = "0.8"
 jsonwebtoken = "9"
 
 # Valkey/Redis
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 
 # HTTP
-hyper = { version = "1", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client", "client-legacy", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "logging", "rustls-platform-verifier"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
@@ -48,5 +52,20 @@ anyhow = "1"
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 dashmap = "6"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 arc-swap = "1"
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+ipnet = "2.12"
+
+# ACME
+instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "ring"] }
+
+# DNS providers (AWS SDK with a ring-based rustls client instead of aws-lc)
+aws-config = { version = "1.12", default-features = false, features = ["rt-tokio", "credentials-process", "sso"] }
+aws-sdk-route53 = { version = "1.122", default-features = false, features = ["rt-tokio"] }
+aws-smithy-http-client = { version = "1.4", default-features = false, features = ["rustls-ring"] }
+aws-credential-types = "1"
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
+
+# Policy plugins
+wasmtime = { version = "48.0.2", default-features = false, features = ["cranelift", "runtime", "wat", "std", "anyhow", "parallel-compilation"] }

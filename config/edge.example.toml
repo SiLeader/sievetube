@@ -1,9 +1,18 @@
 # Sieve Tube Edge Configuration
+#
+# New deployments should use config_version = 2, which makes mesh routing the
+# default. Without config_version the file is read as version 1 and routing stays
+# direct, so upgrading the binary never changes how traffic flows.
+config_version = 2
 
 [server]
 # Address where Connectors connect via QUIC (must be reachable from the internet)
 quic_listen = "0.0.0.0:4433"
-# Public HTTP listener (plain HTTP traffic from end users)
+# Certificate presented to Connectors. Without it a self-signed certificate is
+# generated and Connectors can only pin it or skip verification.
+# quic_cert = "/etc/sievetube/quic/edge.crt"
+# quic_key = "/etc/sievetube/quic/edge.key"
+# Public HTTP listener (plain HTTP traffic from end users; also serves ACME HTTP-01)
 http_listen = "0.0.0.0:80"
 # Public HTTPS listener (TLS-terminated traffic from end users)
 https_listen = "0.0.0.0:443"
@@ -19,21 +28,164 @@ https_listen = "0.0.0.0:443"
 # hostname = "game.example.com"
 # Internal health check and Prometheus metrics endpoint
 health_listen = "127.0.0.1:9090"
+# Time given to in-flight connections on shutdown
+drain_timeout_secs = 30
+# UDP requests keep reply state for this long, bounded per Connector
+udp_reply_timeout_secs = 10
+udp_max_pending_replies = 4096
 
 [auth]
 # HMAC-SHA256 secret used to verify Connector JWTs.
 # Must match the secret used to sign the Connector's token.
 jwt_secret = "change-me-to-a-long-random-secret"
 
+# Limits and timeouts for request-level HTTP/HTTPS proxying
+[http]
+header_read_timeout_secs = 30
+max_header_bytes = 65536
+tls_handshake_timeout_secs = 10
+backend_open_timeout_secs = 10
+response_header_timeout_secs = 60
+h2_max_concurrent_streams = 256
+# Set X-Forwarded-For / X-Forwarded-Proto (see policy.trusted_proxies)
+forwarded_headers = true
+
 [tls]
-# Directory containing TLS certificate pairs for public HTTPS.
+# Directory containing TLS certificate pairs for public HTTPS (BYOC).
 # Each hostname needs two files:
 #   <hostname>.crt  — PEM-encoded certificate chain
 #   <hostname>.key  — PEM-encoded private key
 # Example: web.example.com.crt + web.example.com.key
+# Wildcards use the literal file name "*.example.com.crt".
 cert_dir = "/etc/sievetube/certs"
+# The directory is re-read on this interval and on SIGHUP
+reload_interval_secs = 30
 
-# Optional: Valkey/Redis for control-plane state management (hostname ownership,
-# connector presence). If omitted, the edge runs without state management.
+# Automatic certificates. Only the listed domains are ever ordered, and a domain
+# managed here must not also have a file in cert_dir.
+# [tls.acme]
+# enabled = true
+# directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+# Use the staging directory first: https://acme-staging-v02.api.letsencrypt.org/directory
+# terms_of_service_agreed = true
+# contact_email = "ops@example.com"
+# domains = ["www.example.com"]
+# HTTP-01 needs port 80 reachable from the CA; dns-01 (below) is needed for wildcards
+# challenge = "http-01"
+# state_dir = "/var/lib/sievetube/acme"
+# Renew once this fraction of the certificate's lifetime remains
+# renew_before_fraction = 0.33
+# With several Edges sharing state_dir, one of them orders at a time and the
+# HTTP-01 response is distributed to every live Edge before validation.
+# coordination = "valkey"
+# dns-01 uses the providers configured in [dns]:
+# challenge = "dns-01"
+# dns_resolvers = ["1.1.1.1", "9.9.9.9"]
+
+# Optional: Valkey/Redis for control-plane state (hostname ownership, leases,
+# mesh routes, Edge presence). Without it, a single Edge runs standalone.
 # [valkey]
 # url = "redis://127.0.0.1:6379"
+
+# Built-in traffic policy. Limits are per Edge, not cluster-wide.
+# [policy]
+# enabled = true
+# Start with "monitor" to see decisions without rejecting traffic
+# mode = "enforce"
+# Only these peers' X-Forwarded-For headers are believed
+# trusted_proxies = ["10.0.0.0/8"]
+# blocked_cidrs = ["203.0.113.0/24"]
+# requests_per_second = 50
+# burst = 100
+# max_entries = 100000
+#
+# [[policy.domains]]
+# hostname = "*.api.example.com"
+# requests_per_second = 10
+# burst = 20
+#
+# [policy.tcp]
+# connections_per_second = 20
+# max_concurrent_per_ip = 64
+#
+# [policy.udp]
+# packets_per_second = 500
+# packet_burst = 1000
+# byte_burst = 1000000
+#
+# WebAssembly plugins run after the built-in rules. A plugin may not import
+# anything, and is loaded only if its SHA-256 matches.
+# [[policy.plugins]]
+# name = "geo-block"
+# path = "/etc/sievetube/plugins/geo.wasm"
+# sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# applies_to = ["*.example.com"]
+# max_memory_bytes = 16777216
+# fuel = 10000000
+# timeout_ms = 20
+
+# DNS records managed through provider APIs. Only records listed here are
+# touched; anything else in the zone is left alone.
+# [dns]
+# enabled = true
+# state_dir = "/var/lib/sievetube/dns"
+# allowed_zones = ["example.com"]
+# reconcile_interval_secs = 300
+# Print the planned changes instead of applying them:
+#   sievetube-edge dns-plan /etc/sievetube/edge.toml
+# dry_run = false
+# Without Valkey exactly one Edge may write:
+# single_writer = true
+#
+# [[dns.providers]]
+# name = "cf"
+# type = "cloudflare"
+# zone = "example.com"
+# zone_id = "..."
+# api_token_env = "CLOUDFLARE_API_TOKEN"   # or api_token_file = "/run/secrets/cf"
+#
+# [[dns.providers]]
+# name = "aws"
+# type = "route53"
+# zone = "example.org"
+# hosted_zone_id = "Z123456"               # credentials come from the AWS chain
+#
+# [[dns.records]]
+# provider = "cf"
+# name = "www.example.com"
+# type = "A"
+# values = ["203.0.113.10"]
+# ttl = 300
+# Take over a record Sieve Tube did not create:
+# import = false
+# Delete a managed record (never happens by removing it from this file):
+# state = "present"
+
+# Routing between Edges. "mesh" forwards requests without a local Connector to a
+# peer Edge; "direct" only uses Connectors attached to this Edge.
+#
+# With config_version = 2 the default is "mesh", which requires the [mesh]
+# section below. This example is a single-Edge deployment, so it selects
+# "direct" explicitly; switch to "mesh" once the peers and certificates exist.
+[routing]
+mode = "direct"
+
+# Mesh peers authenticate with certificates from a private CA:
+#   sievetube-edge mesh-ca /etc/sievetube/mesh
+#   sievetube-edge mesh-cert /etc/sievetube/mesh edge-a
+# [mesh]
+# edge_id = "edge-a"
+# listen = "0.0.0.0:4434"
+# advertise = "10.0.0.1:4434"     # address peers use; must not be 0.0.0.0
+# ca_cert = "/etc/sievetube/mesh/ca.pem"
+# cert = "/etc/sievetube/mesh/edge-a.pem"
+# key = "/etc/sievetube/mesh/edge-a.key"
+# udp = true
+# route_ttl_secs = 30
+# route_refresh_secs = 10
+# max_streams_per_peer = 1024
+# max_streams_per_tenant = 256
+#
+# [[mesh.peers]]
+# edge_id = "edge-b"
+# addr = "10.0.0.2:4434"          # optional; defaults to the advertised address

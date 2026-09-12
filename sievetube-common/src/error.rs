@@ -6,10 +6,7 @@ pub enum SieveTubeError {
     Auth(String),
 
     #[error("no matching ingress rule for hostname={hostname:?} protocol={protocol:?}")]
-    NoIngressMatch {
-        hostname: String,
-        protocol: String,
-    },
+    NoIngressMatch { hostname: String, protocol: String },
 
     #[error("connector not connected for hostname={0}")]
     ConnectorNotFound(String),

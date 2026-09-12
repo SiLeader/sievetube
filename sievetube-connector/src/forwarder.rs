@@ -15,13 +15,9 @@ pub async fn forward_tcp(
     tunnel_id: &str,
     hostname: &str,
 ) -> anyhow::Result<(u64, u64)> {
-    let mut local = TcpStream::connect(target_addr).await.map_err(|e| {
-        anyhow::anyhow!(
-            "failed to connect to local target {}: {}",
-            target_addr,
-            e
-        )
-    })?;
+    let mut local = TcpStream::connect(target_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to local target {}: {}", target_addr, e))?;
 
     let (mut local_read, mut local_write) = local.split();
 
@@ -30,12 +26,16 @@ pub async fn forward_tcp(
     // Bidirectional copy with half-close: when one direction ends,
     // shut down the corresponding write side to propagate EOF.
     let quic_to_local = async {
-        let n = tokio::io::copy(&mut recv, &mut local_write).await.unwrap_or(0);
+        let n = tokio::io::copy(&mut recv, &mut local_write)
+            .await
+            .unwrap_or(0);
         let _ = local_write.shutdown().await;
         n
     };
     let local_to_quic = async {
-        let n = tokio::io::copy(&mut local_read, &mut send).await.unwrap_or(0);
+        let n = tokio::io::copy(&mut local_read, &mut send)
+            .await
+            .unwrap_or(0);
         let _ = send.shutdown().await;
         n
     };
@@ -62,10 +62,7 @@ pub async fn forward_tcp(
 }
 
 /// Send an HTTP status response over the QUIC send stream (for http_status targets).
-pub async fn respond_http_status(
-    mut send: quinn::SendStream,
-    status: u16,
-) -> anyhow::Result<()> {
+pub async fn respond_http_status(mut send: quinn::SendStream, status: u16) -> anyhow::Result<()> {
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
@@ -73,9 +70,8 @@ pub async fn respond_http_status(
         503 => "Service Unavailable",
         _ => "Unknown",
     };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-    );
+    let response =
+        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     send.write_all(response.as_bytes()).await?;
     send.finish()?;
     Ok(())
@@ -91,12 +87,7 @@ pub async fn forward_udp_datagram(
 
     // Wait for a reply with a short timeout
     let mut buf = vec![0u8; 65535];
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        socket.recv(&mut buf),
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv(&mut buf)).await {
         Ok(Ok(n)) => {
             buf.truncate(n);
             Ok(Some(buf))

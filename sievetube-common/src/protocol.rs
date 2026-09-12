@@ -29,6 +29,17 @@ const TAG_CONNECT_REQUEST: u8 = 0x03;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthRequest {
     pub jwt: String,
+    /// Protocols the Connector can serve per hostname. Optional for
+    /// compatibility: when absent the Edge assumes every protocol is served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub services: Option<Vec<ServiceAdvertisement>>,
+}
+
+/// A hostname and the protocols a Connector has ingress rules for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceAdvertisement {
+    pub hostname: String,
+    pub protocols: Vec<Protocol>,
 }
 
 /// Sent by Edge → Connector in response to AuthRequest.
@@ -76,9 +87,7 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-pub async fn read_message<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> Result<Message, SieveTubeError> {
+pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message, SieveTubeError> {
     let len = reader.read_u32().await?;
     if len > MAX_FRAME_SIZE {
         return Err(SieveTubeError::Protocol(format!(
@@ -130,9 +139,7 @@ pub struct DatagramHeader {
 impl DatagramHeader {
     pub fn encode(&self, payload: &[u8]) -> bytes::Bytes {
         let hostname_bytes = self.hostname.as_bytes();
-        let mut buf = bytes::BytesMut::with_capacity(
-            8 + 2 + hostname_bytes.len() + payload.len(),
-        );
+        let mut buf = bytes::BytesMut::with_capacity(8 + 2 + hostname_bytes.len() + payload.len());
         buf.extend_from_slice(&self.request_id.to_be_bytes());
         buf.extend_from_slice(&(hostname_bytes.len() as u16).to_be_bytes());
         buf.extend_from_slice(hostname_bytes);
@@ -149,9 +156,17 @@ impl DatagramHeader {
         if data.len() < 10 + hostname_len {
             return None;
         }
-        let hostname = std::str::from_utf8(&data[10..10 + hostname_len]).ok()?.to_string();
+        let hostname = std::str::from_utf8(&data[10..10 + hostname_len])
+            .ok()?
+            .to_string();
         let payload = &data[10 + hostname_len..];
-        Some((DatagramHeader { request_id, hostname }, payload))
+        Some((
+            DatagramHeader {
+                request_id,
+                hostname,
+            },
+            payload,
+        ))
     }
 }
 
@@ -165,12 +180,27 @@ mod tests {
         let mut buf = Vec::new();
         let msg = Message::AuthRequest(AuthRequest {
             jwt: "test.jwt.token".to_string(),
+            services: Some(vec![ServiceAdvertisement {
+                hostname: "web.example.com".to_string(),
+                protocols: vec![Protocol::Http],
+            }]),
         });
         write_message(&mut buf, &msg).await.unwrap();
 
         let mut cursor = Cursor::new(buf);
         let decoded = read_message(&mut cursor).await.unwrap();
-        assert!(matches!(decoded, Message::AuthRequest(_)));
+        match decoded {
+            Message::AuthRequest(r) => {
+                assert_eq!(r.services.unwrap()[0].protocols, [Protocol::Http])
+            }
+            _ => panic!("expected AuthRequest"),
+        }
+    }
+
+    #[test]
+    fn auth_request_without_services_is_accepted() {
+        let legacy: AuthRequest = serde_json::from_str(r#"{"jwt":"a.b.c"}"#).unwrap();
+        assert!(legacy.services.is_none());
     }
 
     #[tokio::test]
@@ -184,7 +214,10 @@ mod tests {
 
         let mut cursor = Cursor::new(buf);
         let decoded = read_message(&mut cursor).await.unwrap();
-        assert!(matches!(decoded, Message::AuthResponse(AuthResponse { ok: true, .. })));
+        assert!(matches!(
+            decoded,
+            Message::AuthResponse(AuthResponse { ok: true, .. })
+        ));
     }
 
     #[tokio::test]
@@ -200,7 +233,10 @@ mod tests {
 
         let mut cursor = Cursor::new(buf);
         let decoded = read_message(&mut cursor).await.unwrap();
-        assert!(matches!(decoded, Message::ConnectRequest(ConnectRequest { request_id: 42, .. })));
+        assert!(matches!(
+            decoded,
+            Message::ConnectRequest(ConnectRequest { request_id: 42, .. })
+        ));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 mod helpers;
 
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
-use std::time::Duration;
 
 /// End-to-end: data sent through a raw TCP tunnel is echoed back correctly.
 #[tokio::test]
@@ -71,8 +71,7 @@ async fn multi_tenant_coexistence() {
     let http_port = helpers::find_free_port();
     let health_port = helpers::find_free_port();
 
-    let edge_cfg =
-        helpers::write_edge_config(quic_port, http_port, health_port, secret, &[]);
+    let edge_cfg = helpers::write_edge_config(quic_port, http_port, health_port, secret, &[]);
 
     let jwt_a = helpers::make_jwt(secret, "tenant-a", &["host-a.test"]);
     let cfg_a = helpers::write_connector_config(
@@ -95,13 +94,17 @@ async fn multi_tenant_coexistence() {
     let _conn_b = helpers::start_connector(&cfg_b).await;
     helpers::wait_for_connectors(health_port, 2).await;
 
-    let resp_a = helpers::http_get(http_port, "host-a.test", "/").await.unwrap();
+    let resp_a = helpers::http_get(http_port, "host-a.test", "/")
+        .await
+        .unwrap();
     assert!(
         resp_a.contains("tenant-A response"),
         "expected tenant-A backend, got:\n{resp_a}"
     );
 
-    let resp_b = helpers::http_get(http_port, "host-b.test", "/").await.unwrap();
+    let resp_b = helpers::http_get(http_port, "host-b.test", "/")
+        .await
+        .unwrap();
     assert!(
         resp_b.contains("tenant-B response"),
         "expected tenant-B backend, got:\n{resp_b}"

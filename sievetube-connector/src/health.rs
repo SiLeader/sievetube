@@ -25,7 +25,9 @@ pub async fn serve(listen_addr: &str) -> anyhow::Result<()> {
     }
 }
 
-async fn handle(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     match req.uri().path() {
         "/healthz" => {
             let body = Full::new(Bytes::from("ok\n"));
@@ -39,7 +41,9 @@ async fn handle(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Byt
             let encoder = prometheus::TextEncoder::new();
             let metric_families = prometheus::gather();
             let mut output = Vec::new();
-            encoder.encode(&metric_families, &mut output).unwrap_or_default();
+            encoder
+                .encode(&metric_families, &mut output)
+                .unwrap_or_default();
 
             let body = Full::new(Bytes::from(output));
             Ok(Response::builder()
@@ -48,11 +52,9 @@ async fn handle(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Byt
                 .body(body)
                 .unwrap())
         }
-        _ => {
-            Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from("not found\n")))
-                .unwrap())
-        }
+        _ => Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Full::new(Bytes::from("not found\n")))
+            .unwrap()),
     }
 }

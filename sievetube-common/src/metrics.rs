@@ -1,6 +1,6 @@
 use prometheus::{
-    register_counter_vec, register_gauge, register_histogram_vec, CounterVec, Gauge,
-    HistogramVec, Registry,
+    register_counter_vec, register_gauge, register_histogram_vec, CounterVec, Gauge, HistogramVec,
+    Registry,
 };
 use std::sync::OnceLock;
 
@@ -64,7 +64,7 @@ pub fn init() -> &'static Metrics {
     })
 }
 
-/// Get the global metrics handle. Panics if `init()` was not called first.
+/// Get the global metrics handle, initializing it on first use.
 pub fn global() -> &'static Metrics {
-    METRICS.get().expect("metrics not initialized — call metrics::init() first")
+    init()
 }

@@ -25,20 +25,13 @@ pub fn sign_jwt(claims: &TunnelClaims, secret: &[u8]) -> Result<String, SieveTub
     .map_err(|e| SieveTubeError::Auth(e.to_string()))
 }
 
-pub fn verify_jwt(
-    token: &str,
-    secret: &[u8],
-) -> Result<TokenData<TunnelClaims>, SieveTubeError> {
+pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<TokenData<TunnelClaims>, SieveTubeError> {
     let mut validation = Validation::default();
     validation.validate_exp = true;
     validation.leeway = 0;
 
-    jsonwebtoken::decode::<TunnelClaims>(
-        token,
-        &DecodingKey::from_secret(secret),
-        &validation,
-    )
-    .map_err(|e| SieveTubeError::Auth(e.to_string()))
+    jsonwebtoken::decode::<TunnelClaims>(token, &DecodingKey::from_secret(secret), &validation)
+        .map_err(|e| SieveTubeError::Auth(e.to_string()))
 }
 
 #[cfg(test)]
