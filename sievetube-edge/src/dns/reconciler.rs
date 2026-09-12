@@ -204,13 +204,56 @@ impl DnsReconciler {
         }
     }
 
-    async fn still_writer(&self, provider: &str, generation: u64) -> bool {
+    /// Extend the writer lease and verify that its fencing generation did not
+    /// change.  A bounded renewal leaves enough TTL to stop an in-flight change
+    /// if the control plane cannot confirm ownership.
+    async fn renew_writer(&self, provider: &str, generation: u64) -> bool {
         match &self.writer {
             WriterMode::SingleWriter => true,
-            WriterMode::Valkey(valkey) => valkey
-                .check_lease(&lease_resource(provider), generation)
-                .await
-                .unwrap_or(false),
+            WriterMode::Valkey(valkey) => {
+                let resource = lease_resource(provider);
+                let renewal = valkey.acquire_lease(&resource, self.settings.lease_ttl, generation);
+                matches!(
+                    tokio::time::timeout(self.settings.lease_ttl / 2, renewal).await,
+                    Ok(Ok(Some(renewed))) if renewed == generation
+                )
+            }
+        }
+    }
+
+    /// Run a provider mutation while periodically extending the writer lease.
+    /// Dropping the provider future on renewal failure prevents a stale writer
+    /// from continuing an HTTP exchange after another Edge can take over.
+    async fn replace_while_writer(
+        &self,
+        provider: &Provider,
+        provider_name: &str,
+        generation: u64,
+        record: &DesiredRecord,
+        expected: Option<&RecordSet>,
+        target: Option<&RecordSet>,
+    ) -> Result<Result<ChangeTicket, DnsError>, ()> {
+        if !self.renew_writer(provider_name, generation).await {
+            return Err(());
+        }
+        let replace = provider.replace(&record.set.name, record.set.record_type, expected, target);
+        tokio::pin!(replace);
+        let renew_every = (self.settings.lease_ttl / 3).max(Duration::from_millis(1));
+        loop {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(renew_every) => {
+                    if !self.renew_writer(provider_name, generation).await {
+                        return Err(());
+                    }
+                }
+                result = &mut replace => {
+                    if !self.renew_writer(provider_name, generation).await {
+                        return Err(());
+                    }
+                    return Ok(result);
+                }
+            }
         }
     }
 
@@ -254,6 +297,7 @@ impl DnsReconciler {
         let mut outcomes = Vec::new();
         let desired_records: Vec<DesiredRecord> =
             self.records_for(provider_name).cloned().collect();
+        let mut lost_writer = false;
         for desired in &desired_records {
             let outcome = self
                 .reconcile_record(&provider, provider_name, desired, &mut state, generation)
@@ -266,6 +310,9 @@ impl DnsReconciler {
             }
             outcomes.push(outcome);
             if stop {
+                lost_writer = outcomes.last().is_some_and(|outcome| {
+                    outcome.error.as_deref() == Some("stop: lost the DNS writer lease")
+                });
                 break;
             }
         }
@@ -275,11 +322,22 @@ impl DnsReconciler {
                 tracing::warn!(provider = provider_name, record = %key, "managed record is no longer configured; it is left unchanged (use state = \"absent\" to delete)");
             }
         }
-        if let Err(e) = self.save_state(provider_name, &state) {
+        // Do not let a stale in-memory snapshot overwrite state saved by the
+        // successor.  Renew immediately before the final shared-state write.
+        if !lost_writer && !self.renew_writer(provider_name, generation).await {
+            lost_writer = true;
             outcomes.push(provider_error(
                 provider_name,
-                format!("cannot persist state: {e:#}"),
+                "stop: lost the DNS writer lease before persisting state".to_string(),
             ));
+        }
+        if !lost_writer {
+            if let Err(e) = self.save_state(provider_name, &state) {
+                outcomes.push(provider_error(
+                    provider_name,
+                    format!("cannot persist state: {e:#}"),
+                ));
+            }
         }
         outcomes
     }
@@ -396,7 +454,7 @@ impl DnsReconciler {
                 expected,
                 desired: target,
             } => {
-                if !self.still_writer(provider_name, generation).await {
+                if !self.renew_writer(provider_name, generation).await {
                     return outcome(action, Some("stop: lost the DNS writer lease".to_string()));
                 }
                 let entry = state
@@ -422,14 +480,22 @@ impl DnsReconciler {
                     return outcome(action, Some(format!("stop: cannot persist state: {e:#}")));
                 }
 
-                let result = provider
-                    .replace(
-                        &desired.set.name,
-                        desired.set.record_type,
+                let result = match self
+                    .replace_while_writer(
+                        provider,
+                        provider_name,
+                        generation,
+                        desired,
                         expected.as_ref(),
                         target.as_ref(),
                     )
-                    .await;
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(()) => {
+                        return outcome(action, Some("stop: lost the DNS writer lease".to_string()))
+                    }
+                };
                 let changes = edge_metrics::get();
                 let kind = provider.kind();
                 match result {

@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 use sievetube_common::hostname;
 
 use super::{ChangeTicket, DnsError, Provider, RecordSet, RecordType};
-use crate::certificate_store::write_atomic;
+use crate::certificate_store::{open_lock_file, write_atomic};
 
 const MAX_ATTEMPTS: u32 = 6;
 
@@ -339,11 +339,17 @@ impl TxtChallengeSolver {
 
     async fn journal_update(&self, update: impl FnOnce(&mut Vec<TxtHandle>)) -> anyhow::Result<()> {
         let _guard = self.journal_lock.lock().await;
-        let mut entries = self.read_journal()?;
-        update(&mut entries);
         if let Some(parent) = self.journal_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Different Edge processes have different Tokio mutexes.  Serialize the
+        // complete read-modify-write transaction with a shared filesystem lock.
+        let lock_path = self.journal_path.with_extension("json.lock");
+        let lock = open_lock_file(&lock_path)?;
+        lock.lock()
+            .with_context(|| format!("cannot lock DNS-01 journal {lock_path:?}"))?;
+        let mut entries = self.read_journal()?;
+        update(&mut entries);
         write_atomic(&self.journal_path, &serde_json::to_vec_pretty(&entries)?)
     }
 }
@@ -498,6 +504,42 @@ mod tests {
             .await
             .is_empty());
         assert!(restarted.read_journal().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn separate_solvers_serialize_shared_journal_updates() {
+        let path = journal();
+        let mut tasks = Vec::new();
+        for i in 0..40 {
+            let solver = solver(Provider::Memory(MemoryProvider::new()), path.clone());
+            tasks.push(tokio::spawn(async move {
+                solver
+                    .journal_update(|entries| {
+                        entries.push(TxtHandle {
+                            zone: "example.com".into(),
+                            name: "_acme-challenge.example.com".into(),
+                            value: format!("token-{i}"),
+                            domain: "example.com".into(),
+                        });
+                    })
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let restarted = solver(Provider::Memory(MemoryProvider::new()), path);
+        let entries = restarted.read_journal().unwrap();
+        assert_eq!(entries.len(), 40);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| &entry.value)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            40
+        );
     }
 
     #[tokio::test]

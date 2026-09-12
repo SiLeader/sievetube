@@ -25,6 +25,7 @@ const KEPT_GENERATIONS: usize = 3;
 const CERT_FILE: &str = "fullchain.pem";
 const KEY_FILE: &str = "privkey.pem";
 const CURRENT_FILE: &str = "current";
+const STORE_LOCK_FILE: &str = ".store.lock";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CertSource {
@@ -236,6 +237,11 @@ impl CertStore {
 
         let dir = self.name_dir(name);
         create_private_dir(&dir)?;
+        // `current` is a compare-and-set pointer.  The lock covers both the
+        // comparison and replacement across every Edge sharing this store.
+        let lock = open_lock_file(&dir.join(STORE_LOCK_FILE))?;
+        lock.lock()
+            .with_context(|| format!("cannot lock certificate store for {name}"))?;
         if let Some(current) = self.current_generation(name)? {
             if generation <= current {
                 bail!("refusing to store generation {generation} for {name}: active generation is {current}");
@@ -349,6 +355,19 @@ fn write_file(path: &Path, data: &[u8], mode: u32) -> anyhow::Result<()> {
     file.write_all(data)?;
     file.sync_all()?;
     Ok(())
+}
+
+pub(crate) fn open_lock_file(path: &Path) -> anyhow::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("cannot open lock file {path:?}"))
 }
 
 /// Replace `path` atomically via a temporary file and rename.
@@ -498,6 +517,37 @@ mod tests {
             .store("web.test", 2, c1.as_bytes(), k1.as_bytes(), NOW)
             .unwrap_err();
         assert!(err.to_string().contains("refusing"));
+        assert_eq!(store.current_generation("web.test").unwrap(), Some(2));
+    }
+
+    #[test]
+    fn concurrent_stores_cannot_move_current_backwards() {
+        let root = tempdir();
+        let store = Arc::new(CertStore::open(&root).unwrap());
+        create_private_dir(&store.name_dir("web.test")).unwrap();
+        let gate = open_lock_file(&store.name_dir("web.test").join(STORE_LOCK_FILE)).unwrap();
+        gate.lock().unwrap();
+
+        let (new_cert, new_key) = generate(&["web.test"], NOW - 10, NOW + 2000);
+        let newer_store = store.clone();
+        let newer = std::thread::spawn(move || {
+            newer_store.store("web.test", 2, new_cert.as_bytes(), new_key.as_bytes(), NOW)
+        });
+        // Queue the stale writer behind the newer one while both are blocked on
+        // the same cross-process lock.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let (old_cert, old_key) = generate(&["web.test"], NOW - 10, NOW + 1000);
+        let stale_store = store.clone();
+        let stale = std::thread::spawn(move || {
+            stale_store.store("web.test", 1, old_cert.as_bytes(), old_key.as_bytes(), NOW)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        gate.unlock().unwrap();
+
+        newer.join().unwrap().unwrap();
+        // Depending on lock wake order, generation 1 is either installed first
+        // or rejected after generation 2.  It must never become current last.
+        let _ = stale.join().unwrap();
         assert_eq!(store.current_generation("web.test").unwrap(), Some(2));
     }
 

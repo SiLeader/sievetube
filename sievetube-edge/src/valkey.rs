@@ -70,6 +70,38 @@ static LEASE_RELEASE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
     )
 });
 
+/// Replace every route belonging to one Edge and refresh the desired set.
+///
+/// KEYS: routes zset.
+/// ARGV: notification channel, edge id, now ms, expiry ms, locally-changed flag,
+/// serialized ads...
+static ROUTES_REPLACE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+local desired = {}
+for i = 6, #ARGV do
+  desired[ARGV[i]] = true
+end
+local removed = 0
+local existing = redis.call('ZRANGE', KEYS[1], 0, -1)
+for _, member in ipairs(existing) do
+  local ok, ad = pcall(cjson.decode, member)
+  if ok and ad['e'] == ARGV[2] and not desired[member] then
+    removed = removed + redis.call('ZREM', KEYS[1], member)
+  end
+end
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[3])
+for i = 6, #ARGV do
+  redis.call('ZADD', KEYS[1], ARGV[4], ARGV[i])
+end
+if removed > 0 or ARGV[5] == '1' then
+  redis.call('PUBLISH', ARGV[1], 'routes')
+end
+return removed
+"#,
+    )
+});
+
 #[derive(Debug, thiserror::Error)]
 pub enum ControlPlaneError {
     #[error("control plane unavailable: {0}")]
@@ -601,18 +633,19 @@ impl ValkeyHandle {
         let digest = digest_members(&members);
         let changed = *self.published_routes() != Some(digest);
 
-        let mut pipe = redis::pipe();
-        pipe.atomic().zrembyscore(MESH_ROUTES_KEY, "-inf", now);
-        for member in members {
-            pipe.zadd(MESH_ROUTES_KEY, member, now + ttl.as_millis() as u64);
+        let mut invocation = ROUTES_REPLACE_SCRIPT.prepare_invoke();
+        invocation
+            .key(MESH_ROUTES_KEY)
+            .arg(MESH_ROUTES_CHANNEL)
+            .arg(&self.inner.edge_id)
+            .arg(now)
+            .arg(now + ttl.as_millis() as u64)
+            .arg(if changed && !ads.is_empty() { 1 } else { 0 });
+        for member in &members {
+            invocation.arg(member);
         }
-        if changed && !ads.is_empty() {
-            pipe.publish(MESH_ROUTES_CHANNEL, "routes");
-        }
-        pipe.query_async::<()>(&mut conn).await?;
-        if !ads.is_empty() {
-            *self.published_routes() = Some(digest);
-        }
+        let _: i64 = invocation.invoke_async(&mut conn).await?;
+        *self.published_routes() = Some(digest);
         Ok(())
     }
 
@@ -825,6 +858,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(third > short);
+    }
+
+    #[tokio::test]
+    async fn publishing_routes_replaces_stale_routes_for_the_edge() {
+        let Some(base) = test_handle().await else {
+            eprintln!("skipping: SIEVETUBE_TEST_VALKEY_URL not set");
+            return;
+        };
+        let url = std::env::var("SIEVETUBE_TEST_VALKEY_URL").unwrap();
+        let edge_id = format!("route-edge-{}", uuid::Uuid::new_v4());
+        let edge = ValkeyHandle::new(&url, &edge_id).unwrap();
+        edge.try_connect().await.unwrap();
+        let make_ad = |hostname: &str, generation| RouteAd {
+            hostname: hostname.to_string(),
+            protocol: sievetube_common::config::Protocol::Http,
+            tenant_id: "tenant".to_string(),
+            edge_id: edge_id.clone(),
+            generation,
+        };
+        let keep = make_ad("keep.test", 2);
+        edge.publish_routes(
+            &[make_ad("keep.test", 1), make_ad("stale.test", 1)],
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        edge.publish_routes(std::slice::from_ref(&keep), Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        let routes: Vec<RouteAd> = edge
+            .fetch_routes()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(ad, _)| ad)
+            .filter(|ad| ad.edge_id == edge_id)
+            .collect();
+        assert_eq!(routes, vec![keep]);
+
+        edge.publish_routes(&[], Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert!(edge
+            .fetch_routes()
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|(ad, _)| ad.edge_id != edge_id));
+        drop(base);
     }
 
     #[tokio::test]
