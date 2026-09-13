@@ -2,10 +2,12 @@
 
 Edge と Connector は TOML ファイルを読み込みます。未知のキーはエラーになるため、タイプミスした設定が黙って無視されることはありません。起動時にアドレス、範囲、ファイルの存在、機能間の依存関係も検証されます。
 
-このページは設定の選び方を説明します。全フィールドと既定値は、実装と同時に更新されるコメント付きサンプルを参照してください。
+このページは設定の選び方を説明します。コメント付きサンプルは主要なフィールドを使った構成例であり、全フィールドを網羅していません。
 
 - [`config/edge.example.toml`](../config/edge.example.toml)
 - [`config/connector.example.toml`](../config/connector.example.toml)
+
+受け付ける全フィールドと既定値の正確な定義は、[`sievetube-edge/src/config.rs`](../sievetube-edge/src/config.rs)、[`sievetube-connector/src/config.rs`](../sievetube-connector/src/config.rs)、および Ingress の [`sievetube-common/src/config.rs`](../sievetube-common/src/config.rs) を参照してください。
 
 ## 設定ファイルの指定
 
@@ -178,4 +180,3 @@ SIEVETUBE_HEALTH_ADDR=127.0.0.1:9191 sievetube-connector /etc/sievetube/connecto
 | Connector の全設定 | Connector の再起動 |
 
 再起動が必要な変更では `/readyz` を使ってロードバランサーから外し、`SIGTERM` で Graceful Shutdown させてください。詳しくは [運用手順](operations.md) を参照してください。
-

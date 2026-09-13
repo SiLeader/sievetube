@@ -38,7 +38,7 @@ cargo build --release
 公開ホスト上でサンプルをコピーします。
 
 ```sh
-cp config/edge.example.toml edge.toml
+install -m 600 config/edge.example.toml edge.toml
 ```
 
 最初の疎通確認では、少なくとも次を確認・変更します。
@@ -93,7 +93,7 @@ JWT の `sub` はテナント識別子です。同じ Edge に同じ `sub` の C
 非公開ホスト上でサンプルをコピーします。
 
 ```sh
-cp config/connector.example.toml connector.toml
+install -m 600 config/connector.example.toml connector.toml
 ```
 
 生成した JWT、Edge のアドレス、ローカルサービスを設定します。
@@ -172,4 +172,3 @@ curl -v -H 'Host: app.example.com' http://203.0.113.10/
 - TCP/UDP、Ingress、設定バージョン: [設定ガイド](configuration.md)
 - 通信経路と認証境界: [アーキテクチャ](architecture.md)
 - 疎通しない場合: [トラブルシューティング](troubleshooting.md)
-
