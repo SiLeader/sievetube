@@ -2,6 +2,8 @@
 
 Edge/Connectorの設定項目は[config/edge.example.toml](../config/edge.example.toml)と[config/connector.example.toml](../config/connector.example.toml)に一覧があります。ここでは有効化の順序、監視、切り戻しをまとめます。
 
+ドキュメント全体の目次は[ドキュメント案内](README.md)を、初回導入は[スタートガイド](getting-started.md)を参照してください。
+
 ## 1. 基本
 
 * 設定はEdgeの起動時に検証されます。値が不正な場合は起動しません（黙って既定値へ戻したり、機能を無効化したりしません）。
