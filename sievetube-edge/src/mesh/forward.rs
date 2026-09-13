@@ -240,15 +240,20 @@ impl MeshService {
             write_forward_request(&mut send, &request)
                 .await
                 .map_err(|e| {
+                    self.pool.mark_failed(&route.edge_id);
                     ForwardError::retryable(format!("cannot send forward request: {e}"))
                 })?;
-            let response = read_forward_response(&mut recv)
-                .await
-                .map_err(|e| ForwardError::retryable(format!("invalid forward response: {e}")))?;
+            let response = read_forward_response(&mut recv).await.map_err(|e| {
+                self.pool.mark_failed(&route.edge_id);
+                ForwardError::retryable(format!("invalid forward response: {e}"))
+            })?;
             Ok::<_, ForwardError>(((send, recv), response))
         })
         .await
-        .map_err(|_| ForwardError::timeout("peer did not answer the forward request"))??;
+        .map_err(|_| {
+            self.pool.mark_failed(&route.edge_id);
+            ForwardError::timeout("peer did not answer the forward request")
+        })??;
         if !response.accepted {
             return Err(ForwardError::rejected(response.reject));
         }

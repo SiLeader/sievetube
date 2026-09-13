@@ -169,8 +169,10 @@ pub async fn run_connection(
                         "another connector with the same token took over this edge; connectors sharing a token must connect to different edges"
                     );
                     backoff = REPLACED_RETRY_DELAY;
+                    Err(anyhow::anyhow!("connection replaced by another connector"))
+                } else {
+                    result
                 }
-                result
             }
             Err(e) => Err(e),
         };
