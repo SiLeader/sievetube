@@ -56,33 +56,38 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(matcher.services(&hostnames))
         });
 
-    // Connect to Valkey and start heartbeat (optional)
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let health = health::ConnectorHealth::new(&cfg.network.public_servers);
+    let background = tokio_util::task::TaskTracker::new();
+
+    // Start a connection-aware Valkey heartbeat (optional). It retries Valkey
+    // itself and only advertises the Connector while an Edge is authenticated.
     if let Some(ref valkey_cfg) = cfg.valkey {
-        let tunnel_id_clone = tunnel_id.clone();
         let url = valkey_cfg.url.clone();
         let interval = std::time::Duration::from_secs(valkey_cfg.heartbeat_interval_secs);
-        let edge_id = cfg
-            .network
-            .public_servers
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-
-        match valkey::connect(&url).await {
-            Ok(conn) => {
-                tracing::info!(url = %url, "connected to valkey");
-                tokio::spawn(async move {
-                    valkey::heartbeat_loop(conn, tunnel_id_clone, edge_id, interval).await;
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to connect to valkey (continuing without heartbeat)");
-            }
-        }
+        let heartbeat_health = health.clone();
+        let heartbeat_shutdown = shutdown_rx.clone();
+        let heartbeat_tunnel = tunnel_id.clone();
+        background.spawn(async move {
+            valkey::heartbeat_loop(
+                url,
+                heartbeat_tunnel,
+                heartbeat_health,
+                interval,
+                heartbeat_shutdown,
+            )
+            .await;
+        });
     }
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let drain_timeout = std::time::Duration::from_secs(cfg.network.drain_timeout_secs);
+    let target_connect_timeout =
+        std::time::Duration::from_secs(cfg.network.target_connect_timeout_secs);
+    // This is shared across every Edge connection so a full-mesh setup cannot
+    // multiply the Connector's task and local-socket limit.
+    let stream_permits = Arc::new(tokio::sync::Semaphore::new(
+        cfg.network.max_concurrent_streams,
+    ));
 
     // How the Edge's certificate is checked (CA, pinning, or not at all).
     let verification = || {
@@ -101,6 +106,8 @@ async fn main() -> anyhow::Result<()> {
         let services = services.clone();
         let tid = tunnel_id.clone();
         let shutdown = shutdown_rx.clone();
+        let stream_permits = stream_permits.clone();
+        let connection_health = health.clone();
 
         let edge_verification = verification()?;
         let server_name = cfg.network.edge_server_name.clone();
@@ -114,6 +121,9 @@ async fn main() -> anyhow::Result<()> {
                 edge_verification,
                 server_name,
                 drain_timeout,
+                target_connect_timeout,
+                stream_permits,
+                connection_health,
                 shutdown,
             )
             .await;
@@ -124,14 +134,21 @@ async fn main() -> anyhow::Result<()> {
     // Health/metrics server
     let health_addr =
         std::env::var("SIEVETUBE_HEALTH_ADDR").unwrap_or_else(|_| "127.0.0.1:9091".to_string());
-    tokio::spawn(async move {
-        if let Err(e) = health::serve(&health_addr).await {
+    let health_listener = tokio::net::TcpListener::bind(&health_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot bind health server at {health_addr}: {e}"))?;
+    let health_state = health.clone();
+    let health_shutdown = shutdown_rx.clone();
+    background.spawn(async move {
+        if let Err(e) = health::serve(health_listener, health_state, health_shutdown).await {
             tracing::error!(error = %e, "health server failed");
         }
     });
+    background.close();
 
     wait_for_shutdown_signal().await;
     tracing::info!("shutdown signal received, draining connections...");
+    health.set_draining();
     let _ = shutdown_tx.send(true);
 
     // Each connection tells its Edge to stop sending new traffic and closes once
@@ -142,6 +159,12 @@ async fn main() -> anyhow::Result<()> {
         .is_err()
     {
         tracing::warn!("connections did not close in time");
+    }
+    if tokio::time::timeout(std::time::Duration::from_secs(5), background.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!("background tasks did not close in time");
     }
     tracing::info!("exiting");
     Ok(())

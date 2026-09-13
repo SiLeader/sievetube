@@ -21,9 +21,13 @@ Edge/Connectorの設定項目は[config/edge.example.toml](../config/edge.exampl
 | `/readyz` | 準備状態。期限切れ証明書、ACME証明書の不在、Valkey未接続があると503 |
 | `/metrics` | Prometheus形式 |
 
+Connector は既定で `127.0.0.1:9091` に同じパスを公開します。Connector の
+`/readyz` は少なくとも1台の Edge への認証済み接続がある場合だけ200を返し、
+再接続中または停止処理中は503を返します。
+
 主なメトリクス（ホスト名・IP・request_idはラベルにしません。詳細は構造化ログを参照してください）:
 
-* `sievetube_bytes_transferred_total`, `sievetube_active_quic_connections`, `sievetube_tunnel_latency_seconds`
+* `sievetube_bytes_transferred_total`, `sievetube_active_quic_connections`, `sievetube_tunnel_duration_seconds`
 * `sievetube_tls_certificates{source,state}`, `sievetube_tls_certificate_min_remaining_seconds{source}`
 * `sievetube_acme_orders_total{result}`, `sievetube_acme_next_attempt_timestamp_seconds`
 * `sievetube_policy_decisions_total{protocol,decision,reason,mode}`, `sievetube_policy_buckets{table}`, `sievetube_policy_plugin_failures_total{plugin,failure}`

@@ -93,17 +93,30 @@ Binding ports below 1024 may require system service capabilities or elevated pri
 
 ### 3. Issue a Connector token
 
-Use the same secret configured as `auth.jwt_secret`:
+Use the same secret configured as `auth.jwt_secret`. Prefer a protected file or
+the `SIEVETUBE_JWT_SECRET` environment variable so the secret is not exposed in
+the process argument list:
 
 ```sh
 ./target/release/sievetube-edge issue-token \
-  --secret 'replace-with-your-secret' \
+  --secret-file /run/secrets/sievetube-jwt \
   --sub tenant-1 \
   --hostname app.example.com \
   --exp-hours 8760
 ```
 
 The command prints a signed JWT. Treat it as a secret: anyone holding it can register the allowed hostnames until the token expires.
+
+Persistent hostname ownership can be inspected and changed with compare-and-set
+admin commands (use `transfer` in place of `release` to move ownership directly):
+
+```sh
+sievetube-edge owner get --valkey-file /run/secrets/valkey-url --hostname app.example.com
+sievetube-edge owner release --valkey-file /run/secrets/valkey-url \
+  --hostname app.example.com --tenant tenant-1
+sievetube-edge owner transfer --valkey-file /run/secrets/valkey-url \
+  --hostname app.example.com --tenant tenant-1 --new-tenant tenant-2
+```
 
 ### 4. Configure and start the Connector
 
@@ -209,7 +222,10 @@ The Edge exposes the following endpoints on `server.health_listen` (default `127
 | `/readyz` | Readiness, including certificate and Valkey checks |
 | `/metrics` | Prometheus metrics |
 
-The Connector exposes health and metrics on `127.0.0.1:9091` by default. Override the address with `SIEVETUBE_HEALTH_ADDR`.
+The Connector exposes the same `/healthz` and `/metrics` paths plus `/readyz`
+on `127.0.0.1:9091` by default. Its readiness is 200 only while at least one
+Edge connection is authenticated and shutdown draining has not begun. Override
+the address with `SIEVETUBE_HEALTH_ADDR`.
 
 Logs are JSON and use `RUST_LOG` for filtering. See [`docs/operations.md`](docs/operations.md) for certificate lifecycle, ACME, policy rollout, DNS reconciliation, multi-Edge mesh setup, monitoring, graceful shutdown, and rollback procedures.
 

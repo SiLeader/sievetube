@@ -4,6 +4,7 @@ use sievetube_common::config::{IngressRule, Protocol, Target};
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectorConfig {
     pub auth: AuthConfig,
     pub network: NetworkConfig,
@@ -13,11 +14,13 @@ pub struct ConnectorConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     pub token: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// List of Edge server addresses (host:port)
     pub public_servers: Vec<String>,
@@ -33,13 +36,29 @@ pub struct NetworkConfig {
     /// How long a shutdown waits for the streams in flight before closing
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_secs: u64,
+    /// Maximum number of tunnel streams that may consume Connector resources
+    /// at once, shared by all Edge connections.
+    #[serde(default = "default_max_concurrent_streams")]
+    pub max_concurrent_streams: usize,
+    /// Maximum time to establish a TCP connection to a local ingress target.
+    #[serde(default = "default_target_connect_timeout")]
+    pub target_connect_timeout_secs: u64,
 }
 
 fn default_drain_timeout() -> u64 {
     10
 }
 
+fn default_max_concurrent_streams() -> usize {
+    256
+}
+
+fn default_target_connect_timeout() -> u64 {
+    10
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValkeyConfig {
     pub url: String,
     #[serde(default = "default_heartbeat_interval")]
@@ -61,11 +80,33 @@ impl ConnectorConfig {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        if self.auth.token.trim().is_empty() {
+            anyhow::bail!("[auth] token must not be empty");
+        }
         if self.ingress.is_empty() {
             anyhow::bail!("at least one [[ingress]] rule is required");
         }
         if self.network.public_servers.is_empty() {
             anyhow::bail!("[network] public_servers must not be empty");
+        }
+        if !(1..=crate::quic_client::MAX_INCOMING_STREAMS as usize)
+            .contains(&self.network.max_concurrent_streams)
+        {
+            anyhow::bail!(
+                "[network] max_concurrent_streams must be between 1 and {}",
+                crate::quic_client::MAX_INCOMING_STREAMS
+            );
+        }
+        if self.network.target_connect_timeout_secs == 0 {
+            anyhow::bail!("[network] target_connect_timeout_secs must be greater than 0");
+        }
+        if let Some(valkey) = &self.valkey {
+            if valkey.url.trim().is_empty() {
+                anyhow::bail!("[valkey] url must not be empty");
+            }
+            if valkey.heartbeat_interval_secs == 0 {
+                anyhow::bail!("[valkey] heartbeat_interval_secs must be greater than 0");
+            }
         }
         for (index, rule) in self.ingress.iter().enumerate() {
             validate_rule(rule)
@@ -203,5 +244,49 @@ target = "127.0.0.1:8080"
 "#;
         let config: ConnectorConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.network.drain_timeout_secs, 10);
+        assert_eq!(config.network.max_concurrent_streams, 256);
+        assert_eq!(config.network.target_connect_timeout_secs, 10);
+    }
+
+    #[test]
+    fn concurrent_stream_limit_is_validated() {
+        for limit in [0, crate::quic_client::MAX_INCOMING_STREAMS as usize + 1] {
+            let toml = format!(
+                r#"
+[auth]
+token = "a.b.c"
+
+[network]
+public_servers = ["edge.test:4433"]
+max_concurrent_streams = {limit}
+
+[[ingress]]
+target = "127.0.0.1:8080"
+"#
+            );
+            let config: ConnectorConfig = toml::from_str(&toml).unwrap();
+            let error = config.validate().unwrap_err();
+            assert!(
+                format!("{error:#}").contains("max_concurrent_streams"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        let toml = r#"
+[auth]
+token = "a.b.c"
+
+[network]
+public_servers = ["edge.test:4433"]
+connect_timout_secs = 10
+
+[[ingress]]
+target = "127.0.0.1:8080"
+"#;
+        let error = toml::from_str::<ConnectorConfig>(toml).unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
     }
 }

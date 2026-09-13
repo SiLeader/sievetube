@@ -81,6 +81,7 @@ pub async fn serve_udp(
     router: Router,
     policy: Arc<Policy>,
     shutdown: CancellationToken,
+    tracker: TaskTracker,
 ) {
     let mut buf = vec![0u8; 65535];
     let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_FORWARDS));
@@ -131,7 +132,7 @@ pub async fn serve_udp(
         let router = router.clone();
         let hostname = hostname.clone();
         let socket = socket.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             let _permit = permit;
             forward_datagram(&router, decision, payload, &hostname, client_addr, socket).await;
         });

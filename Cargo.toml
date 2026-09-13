@@ -6,6 +6,7 @@ members = [
     "sievetube-connector",
     "tests/integration",
 ]
+exclude = ["third_party/instant-acme"]
 
 [workspace.dependencies]
 # Async runtime

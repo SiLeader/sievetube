@@ -34,6 +34,24 @@ pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<TokenData<TunnelClaims>,
         .map_err(|e| SieveTubeError::Auth(e.to_string()))
 }
 
+/// Verify with the active secret and any retained rotation secrets. Secrets
+/// should be ordered newest first; signing always remains a separate operation
+/// using only the active key.
+pub fn verify_jwt_any(
+    token: &str,
+    secrets: &[Vec<u8>],
+) -> Result<TokenData<TunnelClaims>, SieveTubeError> {
+    let mut first_error = None;
+    for secret in secrets {
+        match verify_jwt(token, secret) {
+            Ok(data) => return Ok(data),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    Err(first_error.unwrap_or_else(|| SieveTubeError::Auth("no JWT secrets configured".into())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +90,12 @@ mod tests {
         let claims = make_claims(-3600);
         let token = sign_jwt(&claims, b"secret").unwrap();
         assert!(verify_jwt(&token, b"secret").is_err());
+    }
+
+    #[test]
+    fn retained_secret_allows_rolling_rotation() {
+        let token = sign_jwt(&make_claims(3600), b"old-secret").unwrap();
+        let secrets = vec![b"new-secret".to_vec(), b"old-secret".to_vec()];
+        assert!(verify_jwt_any(&token, &secrets).is_ok());
     }
 }

@@ -33,14 +33,21 @@ drain_timeout_secs = 30
 # UDP requests keep reply state for this long, bounded per Connector
 udp_reply_timeout_secs = 10
 udp_max_pending_replies = 4096
+# Cap handshaking and authenticated Connector QUIC connections.
+max_connector_connections = 4096
 
 [auth]
 # HMAC-SHA256 secret used to verify Connector JWTs.
 # Must match the secret used to sign the Connector's token.
 jwt_secret = "change-me-to-a-long-random-secret"
+# During rotation, put the former secret here until every old token has expired.
+# New tokens are always signed with jwt_secret.
+# jwt_previous_secrets = ["former-secret"]
 
 # Limits and timeouts for request-level HTTP/HTTPS proxying
 [http]
+# Shared cap for active public HTTP and HTTPS client connections.
+max_connections = 4096
 header_read_timeout_secs = 30
 max_header_bytes = 65536
 tls_handshake_timeout_secs = 10

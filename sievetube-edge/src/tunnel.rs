@@ -303,7 +303,7 @@ impl Drop for TunnelStream {
         m.bytes_transferred_total
             .with_label_values(&["out", &protocol])
             .inc_by(self.bytes_out as f64);
-        m.tunnel_latency_seconds
+        m.tunnel_duration_seconds
             .with_label_values(&[&protocol])
             .observe(self.opened_at.elapsed().as_secs_f64());
     }

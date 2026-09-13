@@ -9,6 +9,7 @@ use serde::Deserialize;
 use sievetube_common::hostname;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EdgeConfig {
     /// Configuration format version. Version 2 defaults to mesh routing; an
     /// absent value is treated as version 1 (direct routing) so that upgrading
@@ -458,6 +459,7 @@ pub struct UdpPolicyConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortHostMapping {
     /// Listen address (e.g. "0.0.0.0:2222")
     pub addr: String,
@@ -466,6 +468,7 @@ pub struct PortHostMapping {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Address where Connectors connect via QUIC (e.g. "0.0.0.0:4433")
     pub quic_listen: String,
@@ -495,10 +498,17 @@ pub struct ServerConfig {
     /// Maximum UDP requests awaiting a reply per Connector connection
     #[serde(default = "default_udp_max_pending_replies")]
     pub udp_max_pending_replies: usize,
+    /// Maximum authenticated or handshaking Connector QUIC connections.
+    #[serde(default = "default_max_connector_connections")]
+    pub max_connector_connections: usize,
 }
 
 fn default_udp_reply_timeout_secs() -> u64 {
     10
+}
+
+fn default_max_connector_connections() -> usize {
+    4096
 }
 
 fn default_udp_max_pending_replies() -> usize {
@@ -514,12 +524,18 @@ fn default_drain_timeout_secs() -> u64 {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// HMAC-SHA256 secret used to verify Connector JWTs
     pub jwt_secret: String,
+    /// Older secrets accepted during a rolling rotation. New tokens must be
+    /// signed with jwt_secret; remove old values after their tokens expire.
+    #[serde(default)]
+    pub jwt_previous_secrets: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Directory containing TLS certs for public HTTPS.
     /// Files should be named: <hostname>.crt and <hostname>.key
@@ -730,14 +746,17 @@ impl AcmeConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValkeyConfig {
     pub url: String,
 }
 
 /// Limits and timeouts for request-level HTTP/HTTPS proxying.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HttpConfig {
+    /// Maximum active client connections shared by HTTP and HTTPS listeners.
+    pub max_connections: usize,
     /// Maximum time to receive a complete HTTP/1.x request head
     pub header_read_timeout_secs: u64,
     /// Maximum request/response header size in bytes (HTTP/1 buffer and HTTP/2 header list)
@@ -757,6 +776,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         HttpConfig {
+            max_connections: 4096,
             header_read_timeout_secs: 30,
             max_header_bytes: 64 * 1024,
             tls_handshake_timeout_secs: 10,
@@ -786,6 +806,9 @@ impl HttpConfig {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        if self.max_connections == 0 {
+            bail!("http.max_connections must be greater than 0");
+        }
         // hyper requires HTTP/1 buffers of at least 8 KiB.
         if !(8192..=1024 * 1024).contains(&self.max_header_bytes) {
             bail!("http.max_header_bytes must be between 8192 and 1048576");
@@ -852,11 +875,32 @@ impl EdgeConfig {
             (None, None) => {}
             _ => bail!("server.quic_cert and server.quic_key must be set together"),
         }
-        if self.server.udp_reply_timeout_secs == 0 || self.server.udp_max_pending_replies == 0 {
-            bail!("server.udp_reply_timeout_secs and server.udp_max_pending_replies must be greater than 0");
+        if self.server.udp_reply_timeout_secs == 0
+            || self.server.udp_max_pending_replies == 0
+            || self.server.max_connector_connections == 0
+        {
+            bail!("server UDP limits and max_connector_connections must be greater than 0");
         }
         if self.auth.jwt_secret.is_empty() {
             bail!("auth.jwt_secret must not be empty");
+        }
+        if self
+            .auth
+            .jwt_previous_secrets
+            .iter()
+            .any(|secret| secret.is_empty())
+        {
+            bail!("auth.jwt_previous_secrets must not contain an empty secret");
+        }
+        let mut jwt_secrets = HashSet::new();
+        if !jwt_secrets.insert(self.auth.jwt_secret.as_str())
+            || self
+                .auth
+                .jwt_previous_secrets
+                .iter()
+                .any(|secret| !jwt_secrets.insert(secret.as_str()))
+        {
+            bail!("auth JWT secrets must not contain duplicates");
         }
         crate::policy::compile(&self.policy)?;
         if self.tls.reload_interval_secs == 0 {
@@ -1000,7 +1044,9 @@ cert_dir = "/nonexistent"
     fn minimal_config_uses_defaults() {
         let cfg = EdgeConfig::from_toml(MINIMAL).unwrap();
         assert_eq!(cfg.http.max_header_bytes, 64 * 1024);
+        assert_eq!(cfg.http.max_connections, 4096);
         assert_eq!(cfg.server.drain_timeout_secs, 30);
+        assert_eq!(cfg.server.max_connector_connections, 4096);
         assert!(cfg.valkey.is_none());
     }
 
@@ -1032,6 +1078,12 @@ cert_dir = "/nonexistent"
 
         let unknown_policy_field = format!("{MINIMAL}\n[policy]\nrequest_per_second = 5\n");
         assert!(EdgeConfig::from_toml(&unknown_policy_field).is_err());
+
+        let unknown_server_field = MINIMAL.replace(
+            "quic_listen = \"127.0.0.1:4433\"",
+            "quic_listen = \"127.0.0.1:4433\"\nquic_lisen = \"127.0.0.1:4433\"",
+        );
+        assert!(EdgeConfig::from_toml(&unknown_server_field).is_err());
     }
 
     #[test]

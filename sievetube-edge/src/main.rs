@@ -38,6 +38,7 @@ fn issue_token_command(args: &[String]) -> anyhow::Result<()> {
     use sievetube_common::auth::{sign_jwt, TunnelClaims};
 
     let mut secret: Option<String> = None;
+    let mut secret_file: Option<PathBuf> = None;
     let mut sub: Option<String> = None;
     let mut hostnames: Vec<String> = Vec::new();
     let mut exp_hours: u64 = 8760; // default: 1 year
@@ -52,6 +53,13 @@ fn issue_token_command(args: &[String]) -> anyhow::Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("--secret requires a value"))?
                         .clone(),
                 );
+            }
+            "--secret-file" => {
+                i += 1;
+                secret_file = Some(PathBuf::from(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--secret-file requires a value"))?,
+                ));
             }
             "--sub" => {
                 i += 1;
@@ -77,12 +85,28 @@ fn issue_token_command(args: &[String]) -> anyhow::Result<()> {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("--exp-hours must be a positive integer"))?;
             }
-            other => anyhow::bail!("unknown flag: {other}\nUsage: sievetube-edge issue-token --secret <secret> --sub <tenant_id> --hostname <hostname> [--exp-hours <hours>]"),
+            other => anyhow::bail!("unknown flag: {other}\nUsage: sievetube-edge issue-token (--secret-file <path> | --secret <secret>) --sub <tenant_id> --hostname <hostname> [--exp-hours <hours>]"),
         }
         i += 1;
     }
 
-    let secret = secret.ok_or_else(|| anyhow::anyhow!("--secret is required"))?;
+    if secret.is_some() && secret_file.is_some() {
+        anyhow::bail!("set only one of --secret and --secret-file");
+    }
+    let secret = match (secret, secret_file) {
+        (Some(secret), None) => secret,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("cannot read secret file {}: {e}", path.display()))?
+            .trim_end_matches(['\r', '\n'])
+            .to_string(),
+        (None, None) => std::env::var("SIEVETUBE_JWT_SECRET").map_err(|_| {
+            anyhow::anyhow!("--secret-file, --secret, or SIEVETUBE_JWT_SECRET is required")
+        })?,
+        (Some(_), Some(_)) => unreachable!(),
+    };
+    if secret.is_empty() {
+        anyhow::bail!("JWT secret must not be empty");
+    }
     let sub = sub.ok_or_else(|| anyhow::anyhow!("--sub is required"))?;
     // Mesh messages carry the tenant id and are limited to this length.
     if sub.is_empty() || sub.len() > sievetube_common::mesh_protocol::MAX_ID_LEN {
@@ -116,12 +140,113 @@ fn issue_token_command(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Inspect or safely change persistent hostname ownership in Valkey.
+async fn owner_command(args: &[String]) -> anyhow::Result<()> {
+    let usage = "Usage: sievetube-edge owner <get|release|transfer> (--valkey-file <path> | --valkey <url>) --hostname <hostname> [--tenant <current>] [--new-tenant <new>]";
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| anyhow::anyhow!(usage))?;
+    let mut url = None;
+    let mut url_file = None;
+    let mut hostname = None;
+    let mut tenant = None;
+    let mut new_tenant = None;
+    let mut i = 1;
+    while i < args.len() {
+        let value = args
+            .get(i + 1)
+            .ok_or_else(|| anyhow::anyhow!("{} requires a value\n{usage}", args[i]))?;
+        match args[i].as_str() {
+            "--valkey" => url = Some(value.clone()),
+            "--valkey-file" => url_file = Some(PathBuf::from(value)),
+            "--hostname" => hostname = Some(value.clone()),
+            "--tenant" => tenant = Some(value.clone()),
+            "--new-tenant" => new_tenant = Some(value.clone()),
+            other => anyhow::bail!("unknown flag: {other}\n{usage}"),
+        }
+        i += 2;
+    }
+    if url.is_some() && url_file.is_some() {
+        anyhow::bail!("set only one of --valkey and --valkey-file");
+    }
+    let url = match (url, url_file) {
+        (Some(url), None) => url,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("cannot read Valkey URL file {}: {e}", path.display()))?
+            .trim()
+            .to_string(),
+        (None, None) => std::env::var("SIEVETUBE_VALKEY_URL").map_err(|_| {
+            anyhow::anyhow!("--valkey-file, --valkey, or SIEVETUBE_VALKEY_URL is required")
+        })?,
+        (Some(_), Some(_)) => unreachable!(),
+    };
+    let hostname = sievetube_common::hostname::normalize_hostname(
+        hostname
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--hostname is required"))?,
+    )?;
+    let validate_tenant = |flag: &str, tenant: &str| -> anyhow::Result<()> {
+        if tenant.is_empty() || tenant.len() > sievetube_common::mesh_protocol::MAX_ID_LEN {
+            anyhow::bail!(
+                "{flag} must be between 1 and {} bytes",
+                sievetube_common::mesh_protocol::MAX_ID_LEN
+            );
+        }
+        Ok(())
+    };
+
+    let handle = valkey::ValkeyHandle::new(&url, "ownership-admin")?;
+    handle.try_connect().await?;
+    match action {
+        "get" => match handle.hostname_owner(&hostname).await? {
+            Some(owner) => println!("{hostname}\t{owner}"),
+            None => println!("{hostname}\t<unowned>"),
+        },
+        "release" => {
+            let tenant = tenant
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--tenant is required for release"))?;
+            validate_tenant("--tenant", tenant)?;
+            if !handle.release_hostname_owner(&hostname, tenant).await? {
+                anyhow::bail!("ownership was not released: current owner is not {tenant:?}");
+            }
+            println!("released {hostname} from {tenant}");
+        }
+        "transfer" => {
+            let tenant = tenant
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--tenant is required for transfer"))?;
+            let new_tenant = new_tenant
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--new-tenant is required for transfer"))?;
+            validate_tenant("--tenant", tenant)?;
+            validate_tenant("--new-tenant", new_tenant)?;
+            if tenant == new_tenant {
+                anyhow::bail!("--tenant and --new-tenant must differ");
+            }
+            if !handle
+                .transfer_hostname_owner(&hostname, tenant, new_tenant)
+                .await?
+            {
+                anyhow::bail!("ownership was not transferred: current owner is not {tenant:?}");
+            }
+            println!("transferred {hostname} from {tenant} to {new_tenant}");
+        }
+        _ => anyhow::bail!("unknown owner action: {action}\n{usage}"),
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.get(1).map(String::as_str) == Some("issue-token") {
         return issue_token_command(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("owner") {
+        return owner_command(&args[2..]).await;
     }
 
     // Install the ring CryptoProvider for rustls (required by quinn 0.11 + rustls 0.23)
@@ -161,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = CancellationToken::new();
     let tracker = TaskTracker::new();
+    let background = TaskTracker::new();
     let (reload_tx, reload_rx) = watch::channel(0u64);
     spawn_reload_signal(reload_tx);
 
@@ -169,8 +295,8 @@ async fn main() -> anyhow::Result<()> {
     // Traffic policy: validated at load; SIGHUP re-validates the whole config file
     // and swaps the policy only if it is valid.
     let policy = policy::Policy::new(&cfg.policy)?;
-    tokio::spawn(policy_maintenance_loop(policy.clone(), shutdown.clone()));
-    tokio::spawn(config_reload_loop(
+    background.spawn(policy_maintenance_loop(policy.clone(), shutdown.clone()));
+    background.spawn(config_reload_loop(
         config_path.clone(),
         policy.clone(),
         reload_rx.clone(),
@@ -186,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(Ok(())) => tracing::info!("connected to valkey"),
                 _ => {
                     tracing::warn!("valkey unavailable at startup; new hostname claims are paused until it connects");
-                    tokio::spawn(handle.clone().connect_loop(shutdown.clone()));
+                    background.spawn(handle.clone().connect_loop(shutdown.clone()));
                 }
             }
             Some(handle)
@@ -197,10 +323,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     if let Some(handle) = valkey.clone() {
-        tokio::spawn(presence_loop(handle.clone(), shutdown.clone()));
+        background.spawn(presence_loop(handle.clone(), shutdown.clone()));
         // Keeps readiness and the ACME coordination honest: the client
         // reconnects silently, so reachability has to be checked.
-        tokio::spawn(handle.liveness_loop(VALKEY_LIVENESS_INTERVAL, shutdown.clone()));
+        background.spawn(handle.liveness_loop(VALKEY_LIVENESS_INTERVAL, shutdown.clone()));
     }
 
     // DNS providers are shared by record management and ACME dns-01.
@@ -283,7 +409,7 @@ async fn main() -> anyhow::Result<()> {
                 dns01,
             )?;
             manager.load_existing();
-            tokio::spawn(manager.clone().run(shutdown.clone()));
+            background.spawn(manager.clone().run(shutdown.clone()));
             tracing::info!(domains = ?acme_cfg.domains, directory = %acme_cfg.directory_url, "ACME certificate management enabled");
             Some(manager)
         }
@@ -292,7 +418,7 @@ async fn main() -> anyhow::Result<()> {
     let report = cert_resolver.reload_byoc(&cert_dir, now_unix());
     tracing::info!(cert_dir = %cert_dir.display(), loaded = report.loaded, failed = report.failed, "loaded TLS certificates");
     edge_metrics::update_certificates(&cert_resolver, now_unix());
-    tokio::spawn(certificate_reload_loop(
+    background.spawn(certificate_reload_loop(
         cert_resolver.clone(),
         cert_dir,
         Duration::from_secs(cfg.tls.reload_interval_secs),
@@ -319,7 +445,7 @@ async fn main() -> anyhow::Result<()> {
             dry_run = cfg.dns.dry_run,
             "DNS record management enabled"
         );
-        tokio::spawn(reconciler.run(shutdown.clone()));
+        background.spawn(reconciler.run(shutdown.clone()));
     }
 
     // Edge-to-Edge forwarding
@@ -361,15 +487,21 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let quic_ctx = Arc::new(quic_server::QuicContext {
         registry: registry.clone(),
-        jwt_secret: cfg.auth.jwt_secret.as_bytes().to_vec(),
+        jwt_secrets: std::iter::once(&cfg.auth.jwt_secret)
+            .chain(cfg.auth.jwt_previous_secrets.iter())
+            .map(|secret| secret.as_bytes().to_vec())
+            .collect(),
         valkey: valkey.clone(),
         advertiser: mesh_runtime
             .as_ref()
             .and_then(|runtime| runtime.advertiser.clone()),
         udp_reply_timeout: Duration::from_secs(cfg.server.udp_reply_timeout_secs),
         udp_max_pending_replies: cfg.server.udp_max_pending_replies,
+        connection_permits: Arc::new(tokio::sync::Semaphore::new(
+            cfg.server.max_connector_connections,
+        )),
     });
-    tokio::spawn(quic_server::accept_loop(
+    background.spawn(quic_server::accept_loop(
         quic_endpoint.clone(),
         quic_ctx,
         shutdown.clone(),
@@ -386,7 +518,7 @@ async fn main() -> anyhow::Result<()> {
     // HTTP listener
     let http_listener = TcpListener::bind(&cfg.server.http_listen).await?;
     tracing::info!(addr = %cfg.server.http_listen, "HTTP listener started");
-    tokio::spawn(proxy.clone().serve_http(http_listener, shutdown.clone()));
+    background.spawn(proxy.clone().serve_http(http_listener, shutdown.clone()));
 
     // HTTPS listener: always started; names without a certificate fail the handshake
     // and become available as soon as a certificate is loaded.
@@ -397,7 +529,7 @@ async fn main() -> anyhow::Result<()> {
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
     let https_listener = TcpListener::bind(&cfg.server.https_listen).await?;
     tracing::info!(addr = %cfg.server.https_listen, "HTTPS listener started");
-    tokio::spawn(
+    background.spawn(
         proxy
             .clone()
             .serve_https(https_listener, acceptor, shutdown.clone()),
@@ -407,7 +539,7 @@ async fn main() -> anyhow::Result<()> {
     for entry in &cfg.server.tcp_listen {
         let listener = TcpListener::bind(&entry.addr).await?;
         tracing::info!(addr = %entry.addr, hostname = %entry.hostname, "raw TCP listener started");
-        tokio::spawn(listener::serve_raw_tcp(
+        background.spawn(listener::serve_raw_tcp(
             listener,
             entry.addr.clone(),
             entry.hostname.clone(),
@@ -422,13 +554,14 @@ async fn main() -> anyhow::Result<()> {
     for entry in &cfg.server.udp_listen {
         let socket = Arc::new(UdpSocket::bind(&entry.addr).await?);
         tracing::info!(addr = %entry.addr, hostname = %entry.hostname, "UDP listener started");
-        tokio::spawn(listener::serve_udp(
+        background.spawn(listener::serve_udp(
             socket,
             entry.addr.clone(),
             entry.hostname.clone(),
             router.clone(),
             policy.clone(),
             shutdown.clone(),
+            tracker.clone(),
         ));
     }
 
@@ -455,7 +588,7 @@ async fn main() -> anyhow::Result<()> {
         probes,
     });
     let health_listener = TcpListener::bind(&cfg.server.health_listen).await?;
-    tokio::spawn(health::serve(
+    background.spawn(health::serve(
         health_listener,
         health_state,
         shutdown.clone(),
@@ -467,6 +600,7 @@ async fn main() -> anyhow::Result<()> {
     // Stop accepting, let in-flight public connections finish, then close tunnels.
     shutdown.cancel();
     tracker.close();
+    background.close();
     let drain = Duration::from_secs(cfg.server.drain_timeout_secs);
     if tokio::time::timeout(drain, tracker.wait()).await.is_err() {
         tracing::warn!(
@@ -483,6 +617,16 @@ async fn main() -> anyhow::Result<()> {
         b"server shutting down",
     );
     let _ = tokio::time::timeout(Duration::from_secs(5), quic_endpoint.wait_idle()).await;
+
+    if tokio::time::timeout(Duration::from_secs(5), background.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            remaining = background.len(),
+            "background tasks did not stop in time"
+        );
+    }
 
     tracing::info!("all connections drained, exiting");
     Ok(())

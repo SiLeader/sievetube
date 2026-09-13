@@ -1,8 +1,9 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 
-use sievetube_common::config::Target;
+use sievetube_common::config::{Protocol, Target};
 use sievetube_common::metrics;
 
 /// Forward traffic between a QUIC bidirectional stream and a local TCP target.
@@ -14,9 +15,17 @@ pub async fn forward_tcp(
     target_addr: SocketAddr,
     tunnel_id: &str,
     hostname: &str,
+    protocol: Protocol,
+    connect_timeout: Duration,
 ) -> anyhow::Result<(u64, u64)> {
-    let mut local = TcpStream::connect(target_addr)
+    let mut local = tokio::time::timeout(connect_timeout, TcpStream::connect(target_addr))
         .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out connecting to local target {target_addr} after {}s",
+                connect_timeout.as_secs_f64()
+            )
+        })?
         .map_err(|e| anyhow::anyhow!("failed to connect to local target {}: {}", target_addr, e))?;
 
     let (mut local_read, mut local_write) = local.split();
@@ -44,18 +53,19 @@ pub async fn forward_tcp(
 
     let m = metrics::global();
     m.bytes_transferred_total
-        .with_label_values(&["in", "tcp"])
+        .with_label_values(&["in", &protocol.to_string()])
         .inc_by(bytes_in as f64);
     m.bytes_transferred_total
-        .with_label_values(&["out", "tcp"])
+        .with_label_values(&["out", &protocol.to_string()])
         .inc_by(bytes_out as f64);
 
     tracing::debug!(
         tunnel_id,
         hostname,
+        %protocol,
         bytes_in,
         bytes_out,
-        "tcp tunnel closed"
+        "stream tunnel closed"
     );
 
     Ok((bytes_in, bytes_out))
@@ -91,12 +101,20 @@ pub async fn forward_udp_datagram(
     // host can slip its payload in as the reply.
     socket.connect(target_addr).await?;
     socket.send(payload).await?;
+    metrics::global()
+        .bytes_transferred_total
+        .with_label_values(&["in", "udp"])
+        .inc_by(payload.len() as f64);
 
     // Wait for a reply with a short timeout
     let mut buf = vec![0u8; 65535];
     match tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv(&mut buf)).await {
         Ok(Ok(n)) => {
             buf.truncate(n);
+            metrics::global()
+                .bytes_transferred_total
+                .with_label_values(&["out", "udp"])
+                .inc_by(n as f64);
             Ok(Some(buf))
         }
         Ok(Err(e)) => Err(e.into()),
@@ -111,11 +129,24 @@ pub async fn handle_stream(
     target: Target,
     tunnel_id: String,
     hostname: String,
+    protocol: Protocol,
+    connect_timeout: Duration,
 ) {
+    let started = Instant::now();
     match target {
         Target::Address(addr) => {
-            if let Err(e) = forward_tcp(send, recv, addr, &tunnel_id, &hostname).await {
-                tracing::warn!(tunnel_id, hostname, error = %e, "tcp forward error");
+            if let Err(e) = forward_tcp(
+                send,
+                recv,
+                addr,
+                &tunnel_id,
+                &hostname,
+                protocol,
+                connect_timeout,
+            )
+            .await
+            {
+                tracing::warn!(tunnel_id, hostname, %protocol, error = %e, "stream forward error");
             }
         }
         Target::HttpStatus(status) => {
@@ -124,6 +155,10 @@ pub async fn handle_stream(
             }
         }
     }
+    metrics::global()
+        .tunnel_duration_seconds
+        .with_label_values(&[&protocol.to_string()])
+        .observe(started.elapsed().as_secs_f64());
 }
 
 #[cfg(test)]

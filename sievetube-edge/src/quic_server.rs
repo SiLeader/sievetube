@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use sievetube_common::auth::verify_jwt;
+use sievetube_common::auth::verify_jwt_any;
 use sievetube_common::config::Protocol;
 use sievetube_common::error::app_error;
 use sievetube_common::hostname::{self, HostnameError};
@@ -30,12 +31,13 @@ const RECEIVE_WINDOW: u32 = 128 * 1024 * 1024;
 /// Shared state for Connector connection handling.
 pub struct QuicContext {
     pub registry: ConnectorRegistry,
-    pub jwt_secret: Vec<u8>,
+    pub jwt_secrets: Vec<Vec<u8>>,
     pub valkey: Option<ValkeyHandle>,
     /// Advertises this Edge's routes to mesh peers
     pub advertiser: Option<Arc<RouteAdvertiser>>,
     pub udp_reply_timeout: Duration,
     pub udp_max_pending_replies: usize,
+    pub connection_permits: Arc<Semaphore>,
 }
 
 /// Build a QUIC server endpoint for incoming Connector connections.
@@ -115,9 +117,15 @@ pub async fn accept_loop(
                 None => return,
             },
         };
+        let Ok(permit) = ctx.connection_permits.clone().try_acquire_owned() else {
+            tracing::warn!(remote_addr = %incoming.remote_address(), "connector connection limit reached");
+            incoming.refuse();
+            continue;
+        };
         let ctx = ctx.clone();
 
         tokio::spawn(async move {
+            let _permit = permit;
             let remote_addr = incoming.remote_address();
             match incoming.await {
                 Ok(conn) => {
@@ -159,7 +167,7 @@ async fn handle_connector(connection: quinn::Connection, ctx: Arc<QuicContext>) 
     };
 
     // Verify JWT
-    let claims = match verify_jwt(&auth_req.jwt, &ctx.jwt_secret) {
+    let claims = match verify_jwt_any(&auth_req.jwt, &ctx.jwt_secrets) {
         Ok(data) => data.claims,
         Err(e) => {
             tracing::warn!(remote_addr = %remote, error = %e, "JWT verification failed");

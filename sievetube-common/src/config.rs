@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 /// A single ingress routing rule.
 /// Rules are evaluated top-to-bottom; the first match wins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngressRule {
     /// Optional hostname to match (None = catch-all)
     pub hostname: Option<String>,

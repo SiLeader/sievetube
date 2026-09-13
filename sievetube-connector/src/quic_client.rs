@@ -13,6 +13,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::task::TaskTracker;
 
+use crate::health::ConnectorHealth;
 use crate::ingress::IngressMatcher;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -26,7 +27,7 @@ const STABLE_SESSION: Duration = Duration::from_secs(60);
 /// connection. Reconnecting sooner would take it back and cut its streams.
 const REPLACED_RETRY_DELAY: Duration = Duration::from_secs(60);
 /// Streams the Edge may open at once; it opens one per HTTP request and tunnel.
-const MAX_INCOMING_STREAMS: u32 = 10_000;
+pub(crate) const MAX_INCOMING_STREAMS: u32 = 10_000;
 /// Data the Edge may send on a connection beyond what was passed on to local
 /// targets, over all streams together. Each stream buffers up to its own
 /// window, so without this bound thousands of streams to a target that reads
@@ -170,11 +171,15 @@ pub async fn run_connection(
     verification: EdgeVerification,
     configured_server_name: Option<String>,
     drain_timeout: Duration,
+    target_connect_timeout: Duration,
+    stream_permits: Arc<tokio::sync::Semaphore>,
+    health: ConnectorHealth,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let server_name = match tls_server_name(&server_addr_str, configured_server_name.as_deref()) {
         Ok(name) => name,
         Err(e) => {
+            health.disconnected(&server_addr_str, &e);
             tracing::error!(error = %e, "cannot determine the TLS server name of the edge");
             return;
         }
@@ -190,6 +195,7 @@ pub async fn run_connection(
     let mut endpoints = match EdgeEndpoints::new(verification) {
         Ok(endpoints) => endpoints,
         Err(e) => {
+            health.disconnected(&server_addr_str, &e);
             tracing::error!(error = %e, "failed to build QUIC client configuration");
             return;
         }
@@ -204,6 +210,7 @@ pub async fn run_connection(
         // Waiting after a replacement is not shortened: reconnecting early would
         // take the connection back from the other Connector.
         let mut exact_delay = None;
+        health.connecting(&server_addr_str);
 
         let connect = connect_and_authenticate(
             &mut endpoints,
@@ -219,6 +226,7 @@ pub async fn run_connection(
         };
         let result = match connected {
             Ok(connection) => {
+                health.connected(&server_addr_str);
                 let authenticated_at = Instant::now();
                 sievetube_common::metrics::init()
                     .active_quic_connections
@@ -229,6 +237,8 @@ pub async fn run_connection(
                     &tunnel_id,
                     shutdown.clone(),
                     drain_timeout,
+                    target_connect_timeout,
+                    stream_permits.clone(),
                 )
                 .await;
                 sievetube_common::metrics::global()
@@ -251,6 +261,13 @@ pub async fn run_connection(
             }
             Err(e) => Err(e),
         };
+
+        let health_error = result
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "connection closed".to_string());
+        health.disconnected(&server_addr_str, health_error);
 
         let delay = exact_delay.unwrap_or_else(|| jittered(backoff));
         match result {
@@ -407,6 +424,8 @@ async fn serve_streams(
     tunnel_id: &str,
     mut shutdown: watch::Receiver<bool>,
     drain_timeout: Duration,
+    target_connect_timeout: Duration,
+    stream_permits: Arc<tokio::sync::Semaphore>,
 ) -> anyhow::Result<()> {
     let udp_forwards = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_UDP_FORWARDS));
     // Streams and UDP forwards in flight, which a shutdown lets finish.
@@ -446,12 +465,21 @@ async fn serve_streams(
                     Err(e) => return Err(e.into()),
                 };
 
+                // The QUIC stream limit is deliberately high enough for busy
+                // Edges, but accepted streams consume a task and usually a local
+                // TCP socket. Bound those resources across all Edge connections.
+                let Ok(permit) = stream_permits.clone().try_acquire_owned() else {
+                    tracing::debug!(tunnel_id, "too many active streams, rejecting stream");
+                    continue;
+                };
+
                 // The request is read in the stream's own task, so one slow or
                 // broken stream affects neither the other streams nor the connection.
                 let matcher = matcher.clone();
                 let tid = tunnel_id.to_string();
                 in_flight.spawn(async move {
-                    serve_stream(send, recv, matcher, tid).await;
+                    let _permit = permit;
+                    serve_stream(send, recv, matcher, tid, target_connect_timeout).await;
                 });
             }
 
@@ -510,6 +538,7 @@ async fn serve_stream(
     mut recv: quinn::RecvStream,
     matcher: Arc<IngressMatcher>,
     tunnel_id: String,
+    target_connect_timeout: Duration,
 ) {
     let connect_req = match tokio::time::timeout(
         CONNECT_REQUEST_TIMEOUT,
@@ -553,7 +582,16 @@ async fn serve_stream(
         }
     };
 
-    crate::forwarder::handle_stream(send, recv, target, tunnel_id, hostname).await;
+    crate::forwarder::handle_stream(
+        send,
+        recv,
+        target,
+        tunnel_id,
+        hostname,
+        protocol,
+        target_connect_timeout,
+    )
+    .await;
 }
 
 /// Accepts only certificates whose SHA-256 fingerprint is pinned. Useful when the
@@ -793,6 +831,23 @@ mod tests {
         watch::Sender<bool>,
         tokio::task::JoinHandle<anyhow::Result<()>>,
     ) {
+        serve_with_permits(
+            connector,
+            target,
+            drain_timeout,
+            Arc::new(tokio::sync::Semaphore::new(256)),
+        )
+    }
+
+    fn serve_with_permits(
+        connector: quinn::Connection,
+        target: SocketAddr,
+        drain_timeout: Duration,
+        stream_permits: Arc<tokio::sync::Semaphore>,
+    ) -> (
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
         let matcher = Arc::new(IngressMatcher::new(vec![
             sievetube_common::config::IngressRule {
                 hostname: Some("web.test".to_string()),
@@ -802,7 +857,16 @@ mod tests {
         ]));
         let (stop, shutdown) = watch::channel(false);
         let serving = tokio::spawn(async move {
-            serve_streams(connector, matcher, "tenant", shutdown, drain_timeout).await
+            serve_streams(
+                connector,
+                matcher,
+                "tenant",
+                shutdown,
+                drain_timeout,
+                Duration::from_secs(10),
+                stream_permits,
+            )
+            .await
         });
         (stop, serving)
     }
@@ -868,6 +932,61 @@ mod tests {
             quinn::ConnectionError::ApplicationClosed(close)
                 if close.error_code == quinn::VarInt::from_u32(sievetube_common::error::app_error::GOING_AWAY)
         ));
+    }
+
+    #[tokio::test]
+    async fn excess_streams_do_not_consume_local_connections() {
+        use tokio::io::AsyncWriteExt;
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (connector, edge, _endpoints, _server) = connected_pair().await;
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let (stop, serving) = serve_with_permits(
+            connector,
+            backend.local_addr().unwrap(),
+            Duration::from_secs(5),
+            permits.clone(),
+        );
+
+        let (mut first_send, _first_recv) = open_tunnel(&edge).await;
+        let (mut first_target, _) = backend.accept().await.unwrap();
+        assert_eq!(permits.available_permits(), 0);
+
+        let excess = open_tunnel(&edge).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), backend.accept())
+                .await
+                .is_err(),
+            "a stream beyond the limit reached the local target"
+        );
+        drop(excess);
+
+        first_send.finish().unwrap();
+        first_target.shutdown().await.unwrap();
+        drop(first_target);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while permits.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stream permit is returned when forwarding ends");
+
+        let (mut next_send, _next_recv) = open_tunnel(&edge).await;
+        let (mut next_target, _) = tokio::time::timeout(Duration::from_secs(5), backend.accept())
+            .await
+            .expect("a later stream can use the returned permit")
+            .unwrap();
+        next_send.finish().unwrap();
+        next_target.shutdown().await.unwrap();
+        drop(next_target);
+
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

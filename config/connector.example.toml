@@ -31,6 +31,11 @@ public_servers = [
 # On SIGTERM / Ctrl-C the Connector tells each Edge to send no new traffic and
 # waits this long for requests and tunnels in flight before closing.
 # drain_timeout_secs = 10
+# Maximum active tunnel streams across all Edge connections. Each stream uses
+# a task and usually a local TCP socket, so size this below the process FD limit.
+# max_concurrent_streams = 256
+# Maximum time to connect to a local TCP target before failing the tunnel.
+# target_connect_timeout_secs = 10
 
 # Traffic forwarding rules (Ingress)
 # Rules are evaluated top-to-bottom; the first match wins. Targets are checked

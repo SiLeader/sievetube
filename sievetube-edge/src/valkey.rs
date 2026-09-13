@@ -31,6 +31,20 @@ return {0, ''}
     )
 });
 
+/// Administrative ownership changes are compare-and-set operations: a typo or
+/// stale operator view cannot release or overwrite another tenant's hostname.
+static OWNER_RELEASE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+    redis::Script::new(
+        "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0",
+    )
+});
+
+static OWNER_TRANSFER_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+    redis::Script::new(
+        "if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('SET', KEYS[1], ARGV[2]); return 1 end return 0",
+    )
+});
+
 /// Acquire or extend a lease. The value is `<owner>|<generation>`; a new holder gets
 /// a generation greater than any previous one (and at least `min_generation`), which
 /// callers use as a fencing token.
@@ -146,11 +160,20 @@ struct Inner {
     healthy: AtomicBool,
     edge_id: String,
     /// hostname → tenant ownership confirmed by Valkey during this process lifetime
-    confirmed: Mutex<HashMap<String, String>>,
+    confirmed: Mutex<HashMap<String, ConfirmedOwner>>,
     /// Digest of the last published route set, so that the change notification
     /// is sent when routes change instead of on every refresh
     published_routes: Mutex<Option<u64>>,
 }
+
+struct ConfirmedOwner {
+    tenant_id: String,
+    confirmed_at: std::time::Instant,
+}
+
+/// Valkey outages may briefly use a prior ownership result so existing tunnels
+/// can reconnect, but never indefinitely after an administrative transfer.
+const OWNERSHIP_CACHE_TTL: Duration = Duration::from_secs(60);
 
 impl ValkeyHandle {
     pub fn new(url: &str, edge_id: &str) -> anyhow::Result<Self> {
@@ -298,7 +321,13 @@ impl ValkeyHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         for hostname in hostnames {
-            confirmed.insert(hostname.clone(), tenant_id.to_string());
+            confirmed.insert(
+                hostname.clone(),
+                ConfirmedOwner {
+                    tenant_id: tenant_id.to_string(),
+                    confirmed_at: std::time::Instant::now(),
+                },
+            );
         }
         Ok(ClaimOutcome::Claimed)
     }
@@ -306,14 +335,68 @@ impl ValkeyHandle {
     /// Whether Valkey confirmed these hostnames for the tenant earlier in this
     /// process. Used to let existing tenants reconnect while Valkey is down.
     pub fn previously_confirmed(&self, tenant_id: &str, hostnames: &[String]) -> bool {
-        let confirmed = self
+        let mut confirmed = self
             .inner
             .confirmed
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        hostnames
-            .iter()
-            .all(|h| confirmed.get(h).is_some_and(|owner| owner == tenant_id))
+        confirmed.retain(|_, owner| owner.confirmed_at.elapsed() <= OWNERSHIP_CACHE_TTL);
+        hostnames.iter().all(|h| {
+            confirmed
+                .get(h)
+                .is_some_and(|owner| owner.tenant_id == tenant_id)
+        })
+    }
+
+    /// Return the current owner of a normalized hostname.
+    pub async fn hostname_owner(
+        &self,
+        hostname: &str,
+    ) -> Result<Option<String>, ControlPlaneError> {
+        let mut conn = self.connection()?;
+        Ok(conn.get(owner_key(hostname)).await?)
+    }
+
+    /// Release only if `expected_tenant` is still the owner.
+    pub async fn release_hostname_owner(
+        &self,
+        hostname: &str,
+        expected_tenant: &str,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut conn = self.connection()?;
+        let changed: i64 = OWNER_RELEASE_SCRIPT
+            .key(owner_key(hostname))
+            .arg(expected_tenant)
+            .invoke_async(&mut conn)
+            .await?;
+        self.inner
+            .confirmed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(hostname);
+        Ok(changed == 1)
+    }
+
+    /// Transfer only if `expected_tenant` is still the owner.
+    pub async fn transfer_hostname_owner(
+        &self,
+        hostname: &str,
+        expected_tenant: &str,
+        new_tenant: &str,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut conn = self.connection()?;
+        let changed: i64 = OWNER_TRANSFER_SCRIPT
+            .key(owner_key(hostname))
+            .arg(expected_tenant)
+            .arg(new_tenant)
+            .invoke_async(&mut conn)
+            .await?;
+        self.inner
+            .confirmed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(hostname);
+        Ok(changed == 1)
     }
 
     /// Record that the tenant has a Connector on this Edge (visibility only).

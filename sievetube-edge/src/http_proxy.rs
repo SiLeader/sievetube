@@ -21,7 +21,7 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -144,6 +144,7 @@ pub struct HttpProxy {
     policy: Arc<Policy>,
     acme_challenges: Option<Arc<Http01Challenges>>,
     tracker: TaskTracker,
+    connections: Arc<Semaphore>,
 }
 
 impl HttpProxy {
@@ -154,12 +155,14 @@ impl HttpProxy {
         acme_challenges: Option<Arc<Http01Challenges>>,
         tracker: TaskTracker,
     ) -> Self {
+        let connections = Arc::new(Semaphore::new(settings.max_connections));
         HttpProxy {
             router,
             settings,
             policy,
             acme_challenges,
             tracker,
+            connections,
         }
     }
 
@@ -177,9 +180,14 @@ impl HttpProxy {
                     }
                 },
             };
+            let Ok(permit) = self.connections.clone().try_acquire_owned() else {
+                tracing::debug!(client_addr = %client_addr, "HTTP connection limit reached");
+                continue;
+            };
             let proxy = self.clone();
             let shutdown = shutdown.clone();
             self.tracker.spawn(async move {
+                let _permit = permit;
                 let info = ConnInfo {
                     client_addr,
                     scheme: Scheme::Http,
@@ -211,10 +219,15 @@ impl HttpProxy {
                     }
                 },
             };
+            let Ok(permit) = self.connections.clone().try_acquire_owned() else {
+                tracing::debug!(client_addr = %client_addr, "HTTPS connection limit reached");
+                continue;
+            };
             let proxy = self.clone();
             let acceptor = acceptor.clone();
             let shutdown = shutdown.clone();
             self.tracker.spawn(async move {
+                let _permit = permit;
                 let handshake = tokio::time::timeout(
                     proxy.settings.tls_handshake_timeout(),
                     acceptor.accept(stream),
