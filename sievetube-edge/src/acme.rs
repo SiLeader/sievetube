@@ -494,17 +494,19 @@ impl AcmeManager {
     }
 
     async fn issue(&self, domain: &str, generation: Option<u64>) -> anyhow::Result<CertEntry> {
-        let account = self.account().await?;
-        let identifiers = [Identifier::Dns(domain.to_string())];
-        let mut order = account
-            .new_order(&NewOrder::new(&identifiers))
-            .await
-            .context("new order")?;
-
         let mut published = Published::default();
         let outcome = tokio::time::timeout(
             Duration::from_secs(self.settings.order_timeout_secs),
-            self.complete_order(&mut order, domain, &mut published),
+            async {
+                let account = self.account().await?;
+                let identifiers = [Identifier::Dns(domain.to_string())];
+                let mut order = account
+                    .new_order(&NewOrder::new(&identifiers))
+                    .await
+                    .context("new order")?;
+                self.complete_order(&mut order, domain, &mut published)
+                    .await
+            },
         )
         .await;
         self.cleanup(domain, &published).await;

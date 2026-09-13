@@ -236,7 +236,7 @@ async fn handle_connector(connection: quinn::Connection, ctx: Arc<QuicContext>) 
         .filter(|previous| previous.connection.stable_id() != connection.stable_id())
     {
         previous.connection.close(
-            app_error::GOING_AWAY.into(),
+            app_error::REPLACED.into(),
             b"replaced by a newer connection",
         );
     }

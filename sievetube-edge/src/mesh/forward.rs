@@ -220,11 +220,6 @@ impl MeshService {
                 self.pool.mark_failed(&route.edge_id);
                 ForwardError::retryable(format!("{e:#}"))
             })?;
-        let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
-            self.pool.mark_failed(&route.edge_id);
-            ForwardError::retryable(format!("cannot open mesh stream: {e}"))
-        })?;
-
         let request = ForwardRequest {
             version: MESH_VERSION,
             ingress_edge_id: self.edge_id.clone(),
@@ -237,14 +232,23 @@ impl MeshService {
             hops_remaining: 1,
             connection_generation: route.generation,
         };
-        write_forward_request(&mut send, &request)
-            .await
-            .map_err(|e| ForwardError::retryable(format!("cannot send forward request: {e}")))?;
-        let response =
-            tokio::time::timeout(self.limits.accept_timeout, read_forward_response(&mut recv))
+        let ((send, recv), response) = tokio::time::timeout(self.limits.accept_timeout, async {
+            let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
+                self.pool.mark_failed(&route.edge_id);
+                ForwardError::retryable(format!("cannot open mesh stream: {e}"))
+            })?;
+            write_forward_request(&mut send, &request)
                 .await
-                .map_err(|_| ForwardError::timeout("peer did not answer the forward request"))?
+                .map_err(|e| {
+                    ForwardError::retryable(format!("cannot send forward request: {e}"))
+                })?;
+            let response = read_forward_response(&mut recv)
+                .await
                 .map_err(|e| ForwardError::retryable(format!("invalid forward response: {e}")))?;
+            Ok::<_, ForwardError>(((send, recv), response))
+        })
+        .await
+        .map_err(|_| ForwardError::timeout("peer did not answer the forward request"))??;
         if !response.accepted {
             return Err(ForwardError::rejected(response.reject));
         }
@@ -373,20 +377,30 @@ impl MeshService {
             return;
         };
 
-        let local = match tunnel::open_local_stream(
+        // The ingress Edge gives up after the same timeout, so waiting longer
+        // would only hold this peer's and tenant's stream slots for nothing.
+        let open = tunnel::open_local_stream(
             &connector,
             &request.hostname,
             request.protocol,
             request.client_addr,
-        )
-        .await
-        {
-            Ok(stream) => stream,
-            Err(e) => {
+        );
+        let local = match tokio::time::timeout(self.limits.accept_timeout, open).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
                 tracing::debug!(hostname = %request.hostname, error = %e, "cannot open local tunnel for forwarded request");
                 let _ = write_forward_response(
                     &mut send,
                     &ForwardResponse::reject(reject(RejectReason::NoRoute)),
+                )
+                .await;
+                return;
+            }
+            Err(_) => {
+                tracing::debug!(hostname = %request.hostname, "opening the local tunnel for a forwarded request timed out");
+                let _ = write_forward_response(
+                    &mut send,
+                    &ForwardResponse::reject(reject(RejectReason::Overloaded)),
                 )
                 .await;
                 return;

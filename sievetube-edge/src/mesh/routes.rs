@@ -157,6 +157,10 @@ pub struct RouteAdvertiser {
     info: EdgeInfo,
     ttl: Duration,
     refresh: Duration,
+    /// Serializes publishing and withdrawing. Each publish replaces the whole
+    /// route set from a registry snapshot, so a snapshot taken before a
+    /// concurrent registration or withdrawal must not be written after it.
+    publish_lock: tokio::sync::Mutex<()>,
 }
 
 impl RouteAdvertiser {
@@ -175,11 +179,13 @@ impl RouteAdvertiser {
             info,
             ttl,
             refresh,
+            publish_lock: tokio::sync::Mutex::new(()),
         })
     }
 
     /// Advertise the current routes once.
     pub async fn advertise_now(&self) {
+        let _guard = self.publish_lock.lock().await;
         if let Err(e) = self.valkey.publish_edge_info(&self.info, self.ttl).await {
             tracing::debug!(error = %e, "cannot publish edge info");
             return;
@@ -205,6 +211,7 @@ impl RouteAdvertiser {
 
     /// Withdraw the routes of one registration; only the matching generation is removed.
     pub async fn withdraw(&self, ads: &[RouteAd]) {
+        let _guard = self.publish_lock.lock().await;
         if let Err(e) = self.valkey.withdraw_routes(ads).await {
             tracing::debug!(error = %e, "cannot withdraw routes");
         }

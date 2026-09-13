@@ -12,6 +12,16 @@ use crate::ingress::IngressMatcher;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Wait after another Connector with the same token took over this Edge
+/// connection. Reconnecting sooner would take it back and cut its streams.
+const REPLACED_RETRY_DELAY: Duration = Duration::from_secs(60);
+/// Streams the Edge may open at once; it opens one per HTTP request and tunnel.
+const MAX_INCOMING_STREAMS: u32 = 10_000;
+/// Maximum time for the Edge to deliver a stream's ConnectRequest.
+const CONNECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// UDP datagrams forwarded to local targets at once; each holds a socket while
+/// it waits for a reply, so datagrams beyond this are dropped.
+const MAX_PENDING_UDP_FORWARDS: usize = 1024;
 
 /// How the Edge's QUIC certificate is checked.
 pub enum EdgeVerification {
@@ -69,6 +79,8 @@ fn build_endpoint(verification: EdgeVerification) -> anyhow::Result<quinn::Endpo
         .map_err(|e| anyhow::anyhow!("QuicClientConfig error: {e}"))?;
 
     let mut transport = quinn::TransportConfig::default();
+    // The limit applies to streams the peer opens, and only the Edge opens them.
+    transport.max_concurrent_bidi_streams(MAX_INCOMING_STREAMS.into());
     transport.datagram_receive_buffer_size(Some(65535));
 
     let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
@@ -123,21 +135,49 @@ pub async fn run_connection(
             return;
         }
 
-        match try_connect_and_serve(
+        let result = match connect_and_authenticate(
             &endpoint,
             &server_addr_str,
             &server_name,
             &jwt,
             services.as_deref(),
-            matcher.clone(),
             &tunnel_id,
-            shutdown.clone(),
         )
         .await
         {
+            Ok(connection) => {
+                // An authenticated session proves the Edge is reachable, so a
+                // later disconnect, graceful or not, starts over from a short wait.
+                backoff = INITIAL_BACKOFF;
+                sievetube_common::metrics::init()
+                    .active_quic_connections
+                    .inc();
+                let result = serve_streams(
+                    connection.clone(),
+                    matcher.clone(),
+                    &tunnel_id,
+                    shutdown.clone(),
+                )
+                .await;
+                sievetube_common::metrics::global()
+                    .active_quic_connections
+                    .dec();
+                if replaced_by_another_connector(&connection) {
+                    tracing::warn!(
+                        server = %server_addr_str,
+                        retry_secs = REPLACED_RETRY_DELAY.as_secs(),
+                        "another connector with the same token took over this edge; connectors sharing a token must connect to different edges"
+                    );
+                    backoff = REPLACED_RETRY_DELAY;
+                }
+                result
+            }
+            Err(e) => Err(e),
+        };
+
+        match result {
             Ok(()) => {
                 tracing::info!(server = %server_addr_str, "connection closed gracefully");
-                backoff = INITIAL_BACKOFF;
             }
             Err(e) => {
                 tracing::warn!(
@@ -158,6 +198,17 @@ pub async fn run_connection(
     }
 }
 
+/// Whether the Edge closed the connection because a newer connection of the same
+/// tenant replaced it. A Connector's own reconnect abandons the old connection
+/// first, so a live Connector only sees this when another one shares its token.
+fn replaced_by_another_connector(connection: &quinn::Connection) -> bool {
+    matches!(
+        connection.close_reason(),
+        Some(quinn::ConnectionError::ApplicationClosed(close))
+            if close.error_code == quinn::VarInt::from_u32(sievetube_common::error::app_error::REPLACED)
+    )
+}
+
 /// TLS server name for an Edge address: the configured override, otherwise the
 /// host part of the address. Splitting on `:` would mangle every IPv6 literal.
 fn tls_server_name(server_addr_str: &str, configured: Option<&str>) -> anyhow::Result<String> {
@@ -169,17 +220,15 @@ fn tls_server_name(server_addr_str: &str, configured: Option<&str>) -> anyhow::R
     Ok(host.to_string())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn try_connect_and_serve(
+/// Connect to the Edge and authenticate; returns the connection ready to serve.
+async fn connect_and_authenticate(
     endpoint: &quinn::Endpoint,
     server_addr_str: &str,
     server_name: &str,
     jwt: &str,
     services: Option<&Vec<ServiceAdvertisement>>,
-    matcher: Arc<IngressMatcher>,
     tunnel_id: &str,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<quinn::Connection> {
     // Resolve address
     let server_addr: std::net::SocketAddr = tokio::net::lookup_host(server_addr_str)
         .await
@@ -223,18 +272,7 @@ async fn try_connect_and_serve(
     }
 
     tracing::info!(server = %server_addr_str, tunnel_id, "authenticated, serving streams");
-
-    sievetube_common::metrics::init()
-        .active_quic_connections
-        .inc();
-
-    let result = serve_streams(connection, matcher, tunnel_id, shutdown).await;
-
-    sievetube_common::metrics::global()
-        .active_quic_connections
-        .dec();
-
-    result
+    Ok(connection)
 }
 
 async fn serve_streams(
@@ -243,6 +281,7 @@ async fn serve_streams(
     tunnel_id: &str,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let udp_forwards = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_UDP_FORWARDS));
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -254,42 +293,18 @@ async fn serve_streams(
             }
 
             result = connection.accept_bi() => {
-                let (send, mut recv) = match result {
+                let (send, recv) = match result {
                     Ok(s) => s,
                     Err(quinn::ConnectionError::ApplicationClosed(_)) => return Ok(()),
                     Err(e) => return Err(e.into()),
                 };
 
-                let connect_req = match protocol::read_message(&mut recv).await? {
-                    Message::ConnectRequest(r) => r,
-                    _ => {
-                        tracing::warn!(tunnel_id, "expected ConnectRequest, got something else");
-                        continue;
-                    }
-                };
-
-                let hostname = connect_req.hostname.clone();
-                let protocol = connect_req.protocol;
-
-                tracing::debug!(
-                    tunnel_id,
-                    hostname = %hostname,
-                    protocol = ?protocol,
-                    client_addr = %connect_req.client_addr,
-                    "new stream"
-                );
-
-                let target = match matcher.match_request(&hostname, protocol) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!(tunnel_id, hostname = %hostname, error = %e, "no ingress match");
-                        continue;
-                    }
-                };
-
+                // The request is read in the stream's own task, so one slow or
+                // broken stream affects neither the other streams nor the connection.
+                let matcher = matcher.clone();
                 let tid = tunnel_id.to_string();
                 tokio::spawn(async move {
-                    crate::forwarder::handle_stream(send, recv, target, tid, hostname).await;
+                    serve_stream(send, recv, matcher, tid).await;
                 });
             }
 
@@ -315,9 +330,14 @@ async fn serve_streams(
                     }
                 };
 
+                let Ok(permit) = udp_forwards.clone().try_acquire_owned() else {
+                    tracing::debug!(tunnel_id, hostname = %hostname, "too many pending UDP forwards, dropping datagram");
+                    continue;
+                };
                 let payload = payload.to_vec();
                 let conn = connection.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     match crate::forwarder::forward_udp_datagram(&payload, target_addr).await {
                         Ok(Some(reply)) => {
                             let reply_header = DatagramHeader { request_id, hostname };
@@ -335,6 +355,58 @@ async fn serve_streams(
             }
         }
     }
+}
+
+/// Read one stream's ConnectRequest and forward the stream to its target.
+async fn serve_stream(
+    send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    matcher: Arc<IngressMatcher>,
+    tunnel_id: String,
+) {
+    let connect_req = match tokio::time::timeout(
+        CONNECT_REQUEST_TIMEOUT,
+        protocol::read_message(&mut recv),
+    )
+    .await
+    {
+        Ok(Ok(Message::ConnectRequest(r))) => r,
+        Ok(Ok(_)) => {
+            tracing::warn!(tunnel_id, "expected ConnectRequest, got something else");
+            return;
+        }
+        // The Edge resets streams whose client went away before the request
+        // was complete, so this is routine.
+        Ok(Err(e)) => {
+            tracing::debug!(tunnel_id, error = %e, "cannot read ConnectRequest");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(tunnel_id, "timed out waiting for ConnectRequest");
+            return;
+        }
+    };
+
+    let hostname = connect_req.hostname;
+    let protocol = connect_req.protocol;
+
+    tracing::debug!(
+        tunnel_id,
+        hostname = %hostname,
+        protocol = ?protocol,
+        client_addr = %connect_req.client_addr,
+        "new stream"
+    );
+
+    let target = match matcher.match_request(&hostname, protocol) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(tunnel_id, hostname = %hostname, error = %e, "no ingress match");
+            return;
+        }
+    };
+
+    crate::forwarder::handle_stream(send, recv, target, tunnel_id, hostname).await;
 }
 
 /// Accepts only certificates whose SHA-256 fingerprint is pinned. Useful when the
@@ -492,6 +564,52 @@ mod tests {
             "edge.example.com"
         );
         assert!(tls_server_name("2001:db8::1:4433", None).is_err());
+    }
+
+    /// Connect to a loopback server that closes the connection with `code`.
+    async fn closed_by_server_with(code: u32) -> quinn::Connection {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["edge.test".to_string()]).unwrap();
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap();
+        tls.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+        let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+        ));
+        let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let client = build_endpoint(EdgeVerification::Skip).unwrap();
+        let (_, connection) = tokio::join!(
+            async {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                conn.close(quinn::VarInt::from_u32(code), b"test");
+            },
+            async {
+                client
+                    .connect(server_addr, "edge.test")
+                    .unwrap()
+                    .await
+                    .unwrap()
+            }
+        );
+        connection.closed().await;
+        connection
+    }
+
+    #[tokio::test]
+    async fn replacement_is_told_apart_from_other_closes() {
+        use sievetube_common::error::app_error;
+        assert!(replaced_by_another_connector(
+            &closed_by_server_with(app_error::REPLACED).await
+        ));
+        assert!(!replaced_by_another_connector(
+            &closed_by_server_with(app_error::GOING_AWAY).await
+        ));
     }
 
     #[test]

@@ -30,4 +30,7 @@ pub mod app_error {
     pub const NO_ROUTE: u32 = 2;
     pub const INTERNAL: u32 = 3;
     pub const GOING_AWAY: u32 = 4;
+    /// A newer connection of the same tenant took over on this Edge. A Connector
+    /// that is still running when it receives this shares its token with another.
+    pub const REPLACED: u32 = 5;
 }

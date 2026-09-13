@@ -12,6 +12,8 @@ token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 # Edge servers to connect to (host:port).
 # With mesh routing an Edge forwards to the Edge holding this connection, so a
 # redundant subset is enough; without it, list every Edge.
+# An Edge keeps one connection per tenant: Connectors sharing a token must not
+# list the same Edge, or each new connection replaces the other's.
 public_servers = [
     "pub1.sieve-tube.example.com:4433",
     "pub2.sieve-tube.example.com:4433",

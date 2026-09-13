@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -36,6 +37,8 @@ pub async fn serve(listener: TcpListener, state: Arc<HealthState>, shutdown: Can
                 Ok((stream, _)) => stream,
                 Err(e) => {
                     tracing::debug!(error = %e, "health accept failed");
+                    // Errors such as fd exhaustion persist; retrying at once would spin.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
             },

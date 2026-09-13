@@ -7,6 +7,7 @@ Edge/Connectorの設定項目は[config/edge.example.toml](../config/edge.exampl
 * 設定はEdgeの起動時に検証されます。値が不正な場合は起動しません（黙って既定値へ戻したり、機能を無効化したりしません）。
 * `SIGHUP` で設定ファイルを読み直します。反映されるのは `[policy]`（プラグインを含む）とBYOC証明書です。読み込みや検証に失敗した場合は、稼働中の設定をそのまま維持します。それ以外の項目は再起動が必要です。
 * `SIGTERM` / `Ctrl-C` で新規受付を停止し、`server.drain_timeout_secs` の間だけ処理中の接続を待ってから終了します。
+* Edgeが保持するConnector接続はテナント（トークンの `sub`）ごとに1本です。同じEdgeへ同じテナントの新しい接続が来ると、古い接続は閉じられます。同じトークンで複数のConnectorを動かす場合は、それぞれ別のEdgeへ接続させてください。同じEdgeに接続すると互いに接続を奪い合うため、置き換えられたConnectorは警告をログに出し、60秒待ってから再接続します。
 * 機能はすべて既定で無効です。`[policy]`・`[tls.acme]`・`[dns]` は `enabled = true`、Edge間転送は `routing.mode = "mesh"` で有効になります。
 
 ## 2. 監視
