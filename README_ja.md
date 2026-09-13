@@ -227,3 +227,5 @@ cargo test --workspace
 - `sievetube-connector` — 非公開ネットワーク側のエージェントとローカル転送
 - `sievetube-common` — プロトコル、認証、設定、メトリクスの共通型
 - `tests/integration` — End-to-Endテスト
+
+本プロジェクトはAI支援型コーディングツールを使用して開発されました。

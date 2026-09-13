@@ -243,3 +243,5 @@ The workspace contains:
 - `sievetube-connector` — private-network agent and local forwarder
 - `sievetube-common` — shared protocol, authentication, configuration, and metrics types
 - `tests/integration` — end-to-end tests
+
+This project is developed primarily using AI-assisted coding tools.
