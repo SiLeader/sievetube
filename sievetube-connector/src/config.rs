@@ -1,6 +1,6 @@
 use quinn::rustls;
 use serde::Deserialize;
-use sievetube_common::config::IngressRule;
+use sievetube_common::config::{IngressRule, Protocol, Target};
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +30,13 @@ pub struct NetworkConfig {
     /// Hex SHA-256 fingerprints of accepted Edge certificates (pinning)
     #[serde(default)]
     pub edge_cert_sha256: Vec<String>,
+    /// How long a shutdown waits for the streams in flight before closing
+    #[serde(default = "default_drain_timeout")]
+    pub drain_timeout_secs: u64,
+}
+
+fn default_drain_timeout() -> u64 {
+    10
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +66,10 @@ impl ConnectorConfig {
         }
         if self.network.public_servers.is_empty() {
             anyhow::bail!("[network] public_servers must not be empty");
+        }
+        for (index, rule) in self.ingress.iter().enumerate() {
+            validate_rule(rule)
+                .map_err(|e| anyhow::anyhow!("[[ingress]] rule {}: {e}", index + 1))?;
         }
         let pins = &self.network.edge_cert_sha256;
         if self.network.edge_ca_cert.is_some() && !pins.is_empty() {
@@ -99,5 +110,98 @@ impl ConnectorConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// A rule whose target cannot be used would otherwise only surface as a
+/// hostname the Edge never routes to.
+fn validate_rule(rule: &IngressRule) -> anyhow::Result<()> {
+    match Target::parse(&rule.target).map_err(anyhow::Error::msg)? {
+        Target::Address(_) => {}
+        Target::HttpStatus(code) => {
+            if !(100..=599).contains(&code) {
+                anyhow::bail!("http_status:{code} is not an HTTP status code");
+            }
+            if let Some(protocol @ (Protocol::Tcp | Protocol::Udp)) = rule.protocol {
+                anyhow::bail!("an http_status target cannot answer {protocol} traffic");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(ingress: &str) -> anyhow::Result<()> {
+        let toml = format!(
+            r#"
+[auth]
+token = "a.b.c"
+
+[network]
+public_servers = ["edge.test:4433"]
+edge_cert_sha256 = ["{pin}"]
+
+{ingress}
+"#,
+            pin = "ab".repeat(32),
+        );
+        toml::from_str::<ConnectorConfig>(&toml)?.validate()
+    }
+
+    #[test]
+    fn ingress_targets_are_checked_at_startup() {
+        let valid = r#"
+[[ingress]]
+hostname = "web.test"
+target = "127.0.0.1:8080"
+
+[[ingress]]
+hostname = "game.test"
+protocol = "udp"
+target = "[::1]:19132"
+
+[[ingress]]
+target = "http_status:404"
+"#;
+        config(valid).unwrap();
+
+        for (target, expected) in [
+            ("localhost:8080", "invalid socket address"),
+            ("http_status:abc", "invalid http status code"),
+            ("http_status:42", "not an HTTP status code"),
+        ] {
+            let error = config(&format!("[[ingress]]\ntarget = \"{target}\"")).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{target}: {error:#}"
+            );
+        }
+
+        let status_for_udp = r#"
+[[ingress]]
+protocol = "udp"
+target = "http_status:404"
+"#;
+        let error = config(status_for_udp).unwrap_err();
+        assert!(format!("{error:#}").contains("rule 1"), "{error:#}");
+    }
+
+    #[test]
+    fn drain_timeout_has_a_default() {
+        let toml = r#"
+[auth]
+token = "a.b.c"
+
+[network]
+public_servers = ["edge.test:4433"]
+
+[[ingress]]
+target = "127.0.0.1:8080"
+"#;
+        let config: ConnectorConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.network.drain_timeout_secs, 10);
     }
 }

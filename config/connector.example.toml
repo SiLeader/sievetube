@@ -9,7 +9,8 @@
 token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 
 [network]
-# Edge servers to connect to (host:port).
+# Edge servers to connect to (host:port, IPv6 literals as "[2001:db8::1]:4433").
+# Every address a name resolves to is tried in order until one connects.
 # With mesh routing an Edge forwards to the Edge holding this connection, so a
 # redundant subset is enough; without it, list every Edge.
 # An Edge keeps one connection per tenant: Connectors sharing a token must not
@@ -27,9 +28,14 @@ public_servers = [
 # Alternatively pin the certificates (e.g. when the Edge is self-signed):
 # edge_cert_sha256 = ["0000000000000000000000000000000000000000000000000000000000000000"]
 # With neither set the certificate is not verified; only for migration.
+# On SIGTERM / Ctrl-C the Connector tells each Edge to send no new traffic and
+# waits this long for requests and tunnels in flight before closing.
+# drain_timeout_secs = 10
 
 # Traffic forwarding rules (Ingress)
-# Rules are evaluated top-to-bottom; the first match wins.
+# Rules are evaluated top-to-bottom; the first match wins. Targets are checked
+# at startup: a socket address (IP literal and port) or http_status:<code>,
+# which answers HTTP only.
 # The protocols matched here are also advertised to the Edge, so it only routes
 # traffic this Connector can actually serve.
 

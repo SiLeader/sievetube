@@ -157,16 +157,47 @@ pub fn update_certificates(resolver: &CertResolver, now: i64) {
         m.tls_certificates
             .with_label_values(&[source, "expired"])
             .set(expired as i64);
-        // Without a reset the gauge would keep reporting the last certificate of
-        // a source after it was removed, so alerts would fire (or stay quiet)
-        // against a certificate that no longer exists.
-        let min = entries
-            .iter()
-            .map(|e| e.remaining_secs(now))
-            .min()
-            .unwrap_or(0);
-        m.tls_min_remaining_seconds
-            .with_label_values(&[source])
-            .set(min as f64);
+        let min = entries.iter().map(|e| e.remaining_secs(now)).min();
+        set_min_remaining(&m.tls_min_remaining_seconds, source, min);
+    }
+}
+
+/// Report the smallest remaining validity of a source's certificates. A source
+/// without certificates has no series at all: a value of 0 would read like a
+/// certificate that just expired, and a value left over from a removed
+/// certificate would keep alerts firing (or quiet) for nothing.
+fn set_min_remaining(gauge: &GaugeVec, source: &str, min: Option<i64>) {
+    match min {
+        Some(min) => gauge.with_label_values(&[source]).set(min as f64),
+        None => {
+            let _ = gauge.remove_label_values(&[source]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_source_without_certificates_has_no_remaining_validity() {
+        let gauge =
+            GaugeVec::new(prometheus::Opts::new("test_remaining", "test"), &["source"]).unwrap();
+        let series = |gauge: &GaugeVec| {
+            prometheus::core::Collector::collect(gauge)
+                .iter()
+                .flat_map(|family| family.get_metric().to_vec())
+                .count()
+        };
+        set_min_remaining(&gauge, "acme", Some(3600));
+        assert_eq!(gauge.with_label_values(&["acme"]).get(), 3600.0);
+        set_min_remaining(&gauge, "acme", None);
+        assert_eq!(
+            series(&gauge),
+            0,
+            "no value that looks like an expired certificate"
+        );
+        // Removing a series that was never reported is not an error.
+        set_min_remaining(&gauge, "byoc", None);
     }
 }

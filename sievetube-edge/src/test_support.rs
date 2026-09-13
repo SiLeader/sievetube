@@ -63,3 +63,50 @@ pub async fn quic_pair() -> QuicPair {
         _client_endpoint: client_endpoint,
     }
 }
+
+/// A unique path under the system temporary directory. Whatever ends up there,
+/// a file or a directory tree, is removed when this is dropped.
+pub struct TempPath(std::path::PathBuf);
+
+impl TempPath {
+    /// A path that does not exist yet.
+    pub fn new(prefix: &str) -> Self {
+        TempPath(std::env::temp_dir().join(format!("sievetube-{prefix}-{}", uuid::Uuid::new_v4())))
+    }
+
+    /// A new, empty directory.
+    pub fn dir(prefix: &str) -> Self {
+        let path = Self::new(prefix);
+        std::fs::create_dir_all(&path.0).unwrap();
+        path
+    }
+
+    /// Take over removing an existing path.
+    pub fn adopt(path: impl Into<std::path::PathBuf>) -> Self {
+        TempPath(path.into())
+    }
+}
+
+impl std::ops::Deref for TempPath {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TempPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        if self.0.is_dir() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        } else {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}

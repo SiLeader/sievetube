@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 
@@ -82,8 +82,15 @@ pub async fn forward_udp_datagram(
     payload: &[u8],
     target_addr: SocketAddr,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.send_to(payload, target_addr).await?;
+    let bind: SocketAddr = match target_addr {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let socket = UdpSocket::bind(bind).await?;
+    // A connected socket only receives datagrams from the target, so no other
+    // host can slip its payload in as the reply.
+    socket.connect(target_addr).await?;
+    socket.send(payload).await?;
 
     // Wait for a reply with a short timeout
     let mut buf = vec![0u8; 65535];
@@ -116,5 +123,44 @@ pub async fn handle_stream(
                 tracing::warn!(tunnel_id, hostname, error = %e, "http status response error");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn udp_replies_come_only_from_the_target() {
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let forward = tokio::spawn(async move { forward_udp_datagram(b"ping", target_addr).await });
+
+        let mut buf = [0u8; 16];
+        let (len, forwarder) = target.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"ping");
+        // Another host answers first, from an address that is not the target.
+        let spoofer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        spoofer.send_to(b"spoofed", forwarder).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        target.send_to(b"pong", forwarder).await.unwrap();
+
+        let reply = forward.await.unwrap().unwrap();
+        assert_eq!(reply.as_deref(), Some(&b"pong"[..]));
+    }
+
+    #[tokio::test]
+    async fn udp_targets_can_be_ipv6() {
+        let Ok(target) = UdpSocket::bind("[::1]:0").await else {
+            eprintln!("skipping: no IPv6 loopback");
+            return;
+        };
+        let target_addr = target.local_addr().unwrap();
+        let forward = tokio::spawn(async move { forward_udp_datagram(b"ping", target_addr).await });
+        let mut buf = [0u8; 16];
+        let (_, forwarder) = target.recv_from(&mut buf).await.unwrap();
+        target.send_to(b"pong", forwarder).await.unwrap();
+        let reply = forward.await.unwrap().unwrap();
+        assert_eq!(reply.as_deref(), Some(&b"pong"[..]));
     }
 }

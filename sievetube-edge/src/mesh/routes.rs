@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -73,7 +74,8 @@ fn rank(hostname: &str, edge_id: &str) -> u64 {
 /// Remote routes learned from the control plane.
 #[derive(Default)]
 pub struct RouteTable {
-    routes: ArcSwap<HashMap<(String, Protocol), Vec<RemoteRoute>>>,
+    /// hostname → protocol → routes, best candidate first
+    routes: ArcSwap<HashMap<String, HashMap<Protocol, Vec<RemoteRoute>>>>,
 }
 
 impl RouteTable {
@@ -81,15 +83,28 @@ impl RouteTable {
         Arc::new(RouteTable::default())
     }
 
+    /// Replace all routes. They are ranked here, once per sync, rather than on
+    /// every request.
     pub fn replace(&self, routes: HashMap<(String, Protocol), Vec<RemoteRoute>>) {
-        self.routes.store(Arc::new(routes));
+        let mut table: HashMap<String, HashMap<Protocol, Vec<RemoteRoute>>> = HashMap::new();
+        for ((hostname, protocol), mut candidates) in routes {
+            candidates.sort_by_cached_key(|route| {
+                (rank(&hostname, &route.edge_id), route.edge_id.clone())
+            });
+            table
+                .entry(hostname)
+                .or_default()
+                .insert(protocol, candidates);
+        }
+        self.routes.store(Arc::new(table));
     }
 
     /// Unexpired candidates in a stable order.
     pub fn candidates(&self, hostname: &str, protocol: Protocol, now: Instant) -> Vec<RemoteRoute> {
-        let routes = self.routes.load();
-        let mut candidates: Vec<RemoteRoute> = routes
-            .get(&(hostname.to_string(), protocol))
+        self.routes
+            .load()
+            .get(hostname)
+            .and_then(|protocols| protocols.get(&protocol))
             .map(|routes| {
                 routes
                     .iter()
@@ -97,9 +112,7 @@ impl RouteTable {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default();
-        candidates.sort_by_key(|route| (rank(hostname, &route.edge_id), route.edge_id.clone()));
-        candidates
+            .unwrap_or_default()
     }
 }
 
@@ -160,7 +173,19 @@ pub struct RouteAdvertiser {
     /// Serializes publishing and withdrawing. Each publish replaces the whole
     /// route set from a registry snapshot, so a snapshot taken before a
     /// concurrent registration or withdrawal must not be written after it.
-    publish_lock: tokio::sync::Mutex<()>,
+    publish_lock: tokio::sync::Mutex<PublishState>,
+    /// Number of the latest advertise request
+    advertise_requests: AtomicU64,
+}
+
+#[derive(Default)]
+struct PublishState {
+    /// The last advertise request covered by a successful publish
+    covered: u64,
+    /// Set once the routes were withdrawn for shutdown. A Connector that
+    /// finishes authenticating while the Edge drains must not advertise them
+    /// again.
+    stopped: bool,
 }
 
 impl RouteAdvertiser {
@@ -179,13 +204,25 @@ impl RouteAdvertiser {
             info,
             ttl,
             refresh,
-            publish_lock: tokio::sync::Mutex::new(()),
+            publish_lock: tokio::sync::Mutex::new(PublishState::default()),
+            advertise_requests: AtomicU64::new(0),
         })
     }
 
     /// Advertise the current routes once.
+    ///
+    /// Callers that queued behind a publish whose snapshot was taken after their
+    /// request return at once: their registry changes are already published, and
+    /// publishing the same set again would only hold up the callers behind them.
     pub async fn advertise_now(&self) {
-        let _guard = self.publish_lock.lock().await;
+        let request = self.advertise_requests.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut state = self.publish_lock.lock().await;
+        if state.stopped || state.covered >= request {
+            return;
+        }
+        // Every request issued so far made its registry change before this
+        // point, so the snapshot below covers all of them.
+        let covered = self.advertise_requests.load(Ordering::SeqCst);
         if let Err(e) = self.valkey.publish_edge_info(&self.info, self.ttl).await {
             tracing::debug!(error = %e, "cannot publish edge info");
             return;
@@ -193,7 +230,9 @@ impl RouteAdvertiser {
         let ads = local_ads(&self.registry, &self.edge_id);
         if let Err(e) = self.valkey.publish_routes(&ads, self.ttl).await {
             tracing::debug!(error = %e, "cannot advertise routes");
+            return;
         }
+        state.covered = covered;
     }
 
     /// Withdraw the routes of a disconnected registration. The generation is part
@@ -222,14 +261,23 @@ impl RouteAdvertiser {
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    let ads = local_ads(&self.registry, &self.edge_id);
-                    self.withdraw(&ads).await;
-                    let _ = self.valkey.remove_edge_info().await;
+                    self.stop().await;
                     return;
                 }
                 _ = ticker.tick() => self.advertise_now().await,
             }
         }
+    }
+
+    /// Withdraw every route of this Edge for good.
+    async fn stop(&self) {
+        let mut state = self.publish_lock.lock().await;
+        state.stopped = true;
+        let ads = local_ads(&self.registry, &self.edge_id);
+        if let Err(e) = self.valkey.withdraw_routes(&ads).await {
+            tracing::debug!(error = %e, "cannot withdraw routes");
+        }
+        let _ = self.valkey.remove_edge_info().await;
     }
 }
 
@@ -387,6 +435,13 @@ mod tests {
         let now = Instant::now();
         let first = table.candidates("web.example.com", Protocol::Http, now);
         assert_eq!(first.len(), 2, "expired routes are not returned");
+        let mut expected = vec!["edge-b", "edge-c"];
+        expected.sort_by_key(|edge| (rank("web.example.com", edge), edge.to_string()));
+        assert_eq!(
+            first.iter().map(|r| r.edge_id.as_str()).collect::<Vec<_>>(),
+            expected,
+            "best candidate first"
+        );
         let again = table.candidates("web.example.com", Protocol::Http, now);
         assert_eq!(
             first.iter().map(|r| &r.edge_id).collect::<Vec<_>>(),

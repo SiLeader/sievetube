@@ -262,10 +262,8 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000;
 
-    fn cert_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("sievetube-byoc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn cert_dir() -> crate::test_support::TempPath {
+        crate::test_support::TempPath::dir("byoc")
     }
 
     fn write_pair(dir: &Path, name: &str, not_after: i64) {

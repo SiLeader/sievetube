@@ -417,11 +417,8 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000;
 
-    fn tempdir() -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("sievetube-certstore-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> crate::test_support::TempPath {
+        crate::test_support::TempPath::dir("certstore")
     }
 
     #[test]

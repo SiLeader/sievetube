@@ -17,9 +17,10 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context};
 use dashmap::DashMap;
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
-    NewOrder, OrderStatus, RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, Key, NewOrder,
+    OrderStatus, RetryPolicy,
 };
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -468,29 +469,55 @@ impl AcmeManager {
                     let account = builder()?.from_credentials(credentials).await?;
                     return Ok::<_, anyhow::Error>(account);
                 }
-                let contact = self
-                    .settings
-                    .contact_email
-                    .as_ref()
-                    .map(|email| format!("mailto:{email}"));
-                let contacts: Vec<&str> = contact.iter().map(String::as_str).collect();
+                // The CA registers an account per key, and returns the existing
+                // account when a key is registered again. Storing the key before
+                // asking means an attempt cut short by the order timeout or a
+                // restart is repeated with the same key, instead of leaving an
+                // account behind that nothing refers to and that counts against
+                // the CA's account creation limit.
+                let key = self.pending_account_key()?;
                 let (account, credentials) = builder()?
-                    .create(
-                        &NewAccount {
-                            contact: &contacts,
-                            terms_of_service_agreed: self.settings.terms_of_service_agreed,
-                            only_return_existing: false,
-                        },
+                    .create_from_key(
+                        (
+                            Key::from_pkcs8_der(key.clone_key())?,
+                            PrivateKeyDer::Pkcs8(key),
+                        ),
                         self.settings.directory_url.clone(),
-                        None,
                     )
                     .await?;
+                if let Some(email) = &self.settings.contact_email {
+                    let contact = format!("mailto:{email}");
+                    account
+                        .update_contacts(&[contact.as_str()])
+                        .await
+                        .context("cannot set the ACME account contact")?;
+                }
                 write_atomic(&path, &serde_json::to_vec(&credentials)?)?;
-                tracing::info!(directory = %self.settings.directory_url, "created ACME account");
+                // The key is part of the account file now.
+                let _ = std::fs::remove_file(self.pending_account_key_path());
+                tracing::info!(directory = %self.settings.directory_url, "ACME account ready");
                 Ok(account)
             })
             .await?;
         Ok(account.clone())
+    }
+
+    fn pending_account_key_path(&self) -> PathBuf {
+        self.state_dir.join("account-key.der")
+    }
+
+    /// The key of the account being set up, generated and stored on first use.
+    fn pending_account_key(&self) -> anyhow::Result<PrivatePkcs8KeyDer<'static>> {
+        let path = self.pending_account_key_path();
+        match std::fs::read(&path) {
+            Ok(der) => Ok(PrivatePkcs8KeyDer::from(der)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let (_, der) = Key::generate_pkcs8()?;
+                write_atomic(&path, der.secret_pkcs8_der())?;
+                Ok(der)
+            }
+            Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+        }
     }
 
     async fn issue(&self, domain: &str, generation: Option<u64>) -> anyhow::Result<CertEntry> {
@@ -937,8 +964,8 @@ mod tests {
         }
     }
 
-    fn tempdir(prefix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("sievetube-{prefix}-{}", uuid::Uuid::new_v4()))
+    fn tempdir(prefix: &str) -> crate::test_support::TempPath {
+        crate::test_support::TempPath::new(prefix)
     }
 
     #[tokio::test]
@@ -986,6 +1013,30 @@ mod tests {
         .unwrap();
         restarted.load_existing();
         assert_eq!(restarted.due_at("a.test", NOW + 400), next);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_account_setup_keeps_its_key_for_the_next_attempt() {
+        let dir = tempdir("acme-account");
+        let manager = AcmeManager::new(
+            settings(&dir),
+            CertResolver::new(),
+            Arc::new(FakeClock(AtomicI64::new(NOW))),
+            Coordination::Local,
+            None,
+        )
+        .unwrap();
+        let key_path = manager.pending_account_key_path();
+
+        // The CA cannot be reached, so the account is not set up.
+        assert!(manager.account().await.is_err());
+        let key = std::fs::read(&key_path).expect("the key is stored before the CA is asked");
+        assert!(manager.account().await.is_err());
+        assert_eq!(
+            std::fs::read(&key_path).unwrap(),
+            key,
+            "a retry asks for the account of the same key"
+        );
     }
 
     #[tokio::test]
@@ -1053,8 +1104,9 @@ mod tests {
             .await
             .unwrap();
 
-        let make = |valkey: ValkeyHandle| {
-            let mut cfg = settings(&tempdir("acme-dist"));
+        let (state_a, state_b) = (tempdir("acme-dist"), tempdir("acme-dist"));
+        let make = |valkey: ValkeyHandle, state: &std::path::Path| {
+            let mut cfg = settings(state);
             cfg.domains = vec![domain.clone()];
             cfg.coordination = AcmeCoordination::Valkey;
             AcmeManager::new(
@@ -1066,8 +1118,8 @@ mod tests {
             )
             .unwrap()
         };
-        let manager_a = make(edge_a.clone());
-        let manager_b = make(edge_b.clone());
+        let manager_a = make(edge_a.clone(), &state_a);
+        let manager_b = make(edge_b.clone(), &state_b);
 
         // Edge B is live but has not announced that it answers challenges (e.g.
         // ACME is disabled there). It never confirms one, so waiting for it
@@ -1185,6 +1237,8 @@ mod tests {
 
         struct Pebble {
             _processes: Vec<KillOnDrop>,
+            /// Removed after the processes that read the configuration in it
+            _config_dir: crate::test_support::TempPath,
             directory_url: String,
             minica: String,
             dns: SocketAddr,
@@ -1234,8 +1288,8 @@ mod tests {
                 "ocspResponderURL": "", "externalAccountBindingRequired": false,
                 "retryAfter": {"authz": 1, "order": 1}, "keyAlgorithm": "ecdsa",
             }});
-            let config_path = tempdir("pebble-dns01").join("pebble.json");
-            std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+            let config_dir = crate::test_support::TempPath::dir("pebble-dns01");
+            let config_path = config_dir.join("pebble.json");
             std::fs::write(&config_path, config.to_string()).unwrap();
             let pebble = KillOnDrop(
                 Command::new(pebble)
@@ -1256,6 +1310,7 @@ mod tests {
                 {
                     return Some(Pebble {
                         _processes: vec![challtestsrv, pebble],
+                        _config_dir: config_dir,
                         directory_url: format!("https://localhost:{acme_port}/dir"),
                         minica: certs.join("pebble.minica.pem").display().to_string(),
                         dns: format!("127.0.0.1:{dns_port}").parse().unwrap(),

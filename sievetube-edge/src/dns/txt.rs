@@ -410,6 +410,8 @@ async fn retry_or_fail(error: DnsError, attempt: u32) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
     use crate::dns::contract_tests::CloudflareMock;
     use crate::dns::memory::MemoryProvider;
 
@@ -421,20 +423,18 @@ mod tests {
         }
     }
 
-    fn journal() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "sievetube-txt-{}/journal.json",
-            uuid::Uuid::new_v4()
-        ))
+    /// A directory for a journal, removed with it when dropped.
+    fn journal() -> crate::test_support::TempPath {
+        crate::test_support::TempPath::new("txt")
     }
 
-    fn solver(provider: Provider, journal: PathBuf) -> TxtChallengeSolver {
+    fn solver(provider: Provider, journal: &Path) -> TxtChallengeSolver {
         TxtChallengeSolver::new(
             vec![("example.com".to_string(), Arc::new(provider))],
             vec!["example.com".to_string()],
             TxtLookup::ProviderApi,
             settings(),
-            journal,
+            journal.join("journal.json"),
         )
     }
 
@@ -457,7 +457,8 @@ mod tests {
             values: ["operator-value".to_string()].into(),
             proxied: None,
         });
-        let solver = solver(Provider::Memory(memory), journal());
+        let journal = journal();
+        let solver = solver(Provider::Memory(memory), &journal);
 
         // Wildcard and base name orders validate at the same time.
         let (wildcard, base) = tokio::join!(
@@ -490,11 +491,11 @@ mod tests {
     async fn journal_cleans_up_after_restart() {
         let memory = MemoryProvider::new();
         let path = journal();
-        let first = solver(Provider::Memory(memory.clone()), path.clone());
+        let first = solver(Provider::Memory(memory.clone()), &path);
         first.add("example.com", "left-behind").await.unwrap();
         drop(first);
 
-        let restarted = solver(Provider::Memory(memory), path.clone());
+        let restarted = solver(Provider::Memory(memory), &path);
         assert_eq!(
             values(&restarted, "_acme-challenge.example.com").await,
             ["left-behind"]
@@ -511,7 +512,7 @@ mod tests {
         let path = journal();
         let mut tasks = Vec::new();
         for i in 0..40 {
-            let solver = solver(Provider::Memory(MemoryProvider::new()), path.clone());
+            let solver = solver(Provider::Memory(MemoryProvider::new()), &path);
             tasks.push(tokio::spawn(async move {
                 solver
                     .journal_update(|entries| {
@@ -529,7 +530,7 @@ mod tests {
         for task in tasks {
             task.await.unwrap();
         }
-        let restarted = solver(Provider::Memory(MemoryProvider::new()), path);
+        let restarted = solver(Provider::Memory(MemoryProvider::new()), &path);
         let entries = restarted.read_journal().unwrap();
         assert_eq!(entries.len(), 40);
         assert_eq!(
@@ -545,9 +546,10 @@ mod tests {
     #[tokio::test]
     async fn works_through_the_cloudflare_adapter() {
         let mock = CloudflareMock::start().await;
+        let journal = journal();
         let solver = solver(
             mock.provider(crate::dns::contract_tests::MOCK_TOKEN),
-            journal(),
+            &journal,
         );
         let handle = solver.add("www.example.com", "cf-token").await.unwrap();
         assert_eq!(handle.name, "_acme-challenge.www.example.com");
@@ -560,7 +562,8 @@ mod tests {
 
     #[tokio::test]
     async fn journal_entries_carry_their_domain() {
-        let solver = solver(Provider::Memory(MemoryProvider::new()), journal());
+        let journal = journal();
+        let solver = solver(Provider::Memory(MemoryProvider::new()), &journal);
         solver.add("www.example.com", "token").await.unwrap();
         let entries = solver.journal_entries();
         assert_eq!(entries.len(), 1);
@@ -578,7 +581,8 @@ mod tests {
 
     #[tokio::test]
     async fn names_outside_provider_zones_are_rejected() {
-        let solver = solver(Provider::Memory(MemoryProvider::new()), journal());
+        let journal = journal();
+        let solver = solver(Provider::Memory(MemoryProvider::new()), &journal);
         assert!(solver.add("example.net", "x").await.is_err());
         assert!(delegation_allowed(
             "_acme-challenge.example.com",
@@ -592,7 +596,8 @@ mod tests {
 
     #[tokio::test]
     async fn propagation_timeout_fails_the_wait() {
-        let solver = solver(Provider::Memory(MemoryProvider::new()), journal());
+        let journal = journal();
+        let solver = solver(Provider::Memory(MemoryProvider::new()), &journal);
         let handle = TxtHandle {
             zone: "example.com".into(),
             name: "_acme-challenge.example.com".into(),

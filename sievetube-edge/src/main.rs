@@ -84,6 +84,13 @@ fn issue_token_command(args: &[String]) -> anyhow::Result<()> {
 
     let secret = secret.ok_or_else(|| anyhow::anyhow!("--secret is required"))?;
     let sub = sub.ok_or_else(|| anyhow::anyhow!("--sub is required"))?;
+    // Mesh messages carry the tenant id and are limited to this length.
+    if sub.is_empty() || sub.len() > sievetube_common::mesh_protocol::MAX_ID_LEN {
+        anyhow::bail!(
+            "--sub must be between 1 and {} bytes",
+            sievetube_common::mesh_protocol::MAX_ID_LEN
+        );
+    }
     if hostnames.is_empty() {
         anyhow::bail!("at least one --hostname is required");
     }

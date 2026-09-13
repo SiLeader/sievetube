@@ -58,9 +58,16 @@ pub fn unique_id() -> String {
     )
 }
 
+/// Where tests put their files: Cargo's directory for integration test data
+/// inside `target`, which `cargo clean` removes, rather than the system
+/// temporary directory, where every run would leave its files behind.
+fn test_tmp_dir() -> &'static Path {
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+}
+
 /// Create a fresh temporary directory.
 pub fn temp_dir(prefix: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("sievetube-{prefix}-{}", unique_id()));
+    let dir = test_tmp_dir().join(format!("sievetube-{prefix}-{}", unique_id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
@@ -122,7 +129,7 @@ impl EdgeTestConfig {
     }
 
     pub fn write(&self) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("sievetube-edge-{}.toml", unique_id()));
+        let path = test_tmp_dir().join(format!("sievetube-edge-{}.toml", unique_id()));
         self.write_to(&path);
         path
     }
@@ -252,7 +259,7 @@ pub fn write_connector_config_with_network(
     ingress: &[(&str, &str, &str)],
     network_extra: &str,
 ) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("sievetube-connector-{}.toml", unique_id()));
+    let path = test_tmp_dir().join(format!("sievetube-connector-{}.toml", unique_id()));
 
     let mut ingress_toml = String::new();
     for (hostname, protocol, target) in ingress {

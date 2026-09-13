@@ -124,15 +124,40 @@ impl PeerPool {
             .is_some_and(|until| *until > Instant::now())
     }
 
-    pub fn mark_failed(&self, edge_id: &str) {
+    fn start_cooldown(&self, edge_id: &str) {
         self.cooldown
             .insert(edge_id.to_string(), Instant::now() + self.cooldown_period);
-        if let Some((_, connection)) = self.connections.remove(edge_id) {
-            connection.close(0u32.into(), b"peer marked failed");
+    }
+
+    /// Report a failure seen on `connection`. Only a closed connection says
+    /// anything about the peer: a failed stream on a live connection leaves the
+    /// connection and its other streams alone. A newer connection that replaced
+    /// the closed one is kept as well.
+    pub fn connection_failed(&self, edge_id: &str, connection: &quinn::Connection) {
+        if connection.close_reason().is_none() {
+            return;
+        }
+        let evicted = self
+            .connections
+            .remove_if(edge_id, |_, pooled| {
+                pooled.stable_id() == connection.stable_id()
+            })
+            .is_some();
+        if evicted || !self.connections.contains_key(edge_id) {
+            self.start_cooldown(edge_id);
         }
     }
 
-    /// An open connection to `edge_id` at `addr`, connecting if needed.
+    /// Give up on a connection whose peer stopped answering altogether. QUIC
+    /// would only notice at the idle timeout, and until then every request
+    /// routed to the peer waits for its own timeout.
+    pub fn connection_unresponsive(&self, edge_id: &str, connection: &quinn::Connection) {
+        connection.close(0u32.into(), b"peer unresponsive");
+        self.connection_failed(edge_id, connection);
+    }
+
+    /// An open connection to `edge_id` at `addr`, connecting if needed. A failed
+    /// attempt cools the peer down, and no new attempt is made until that ends.
     pub async fn connection(
         &self,
         edge_id: &str,
@@ -144,6 +169,9 @@ impl PeerPool {
         if let Some(existing) = self.usable(edge_id) {
             return Ok(existing);
         }
+        if self.cooling_down(edge_id) {
+            bail!("edge {edge_id} failed recently");
+        }
         let lock = self
             .connect_locks
             .entry(edge_id.to_string())
@@ -153,7 +181,17 @@ impl PeerPool {
         if let Some(existing) = self.usable(edge_id) {
             return Ok(existing);
         }
+        // Requests that queued behind a failed attempt must not each repeat it
+        // and wait for their own connect timeout.
+        if self.cooling_down(edge_id) {
+            bail!("edge {edge_id} failed recently");
+        }
+        self.connect(edge_id, addr).await.inspect_err(|_| {
+            self.start_cooldown(edge_id);
+        })
+    }
 
+    async fn connect(&self, edge_id: &str, addr: SocketAddr) -> anyhow::Result<quinn::Connection> {
         let connecting = self
             .endpoint
             .connect(addr, &server_name(edge_id))
@@ -280,11 +318,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_peers_cool_down() {
+    async fn failed_connects_cool_down_without_being_repeated() {
         let pki = TestPki::new();
-        let (pool_a, _endpoint) = pool(&pki, "edge-a", &["edge-b"]);
+        crate::test_support::install_crypto();
+        let endpoint =
+            build_endpoint(&pki.identity("edge-a"), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let pool_a = PeerPool::new(
+            endpoint,
+            HashSet::from(["edge-b".to_string()]),
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+            None,
+        );
+        // Nothing answers here, so connecting runs into the connect timeout.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = silent.local_addr().unwrap();
         assert!(!pool_a.cooling_down("edge-b"));
-        pool_a.mark_failed("edge-b");
+
+        let started = Instant::now();
+        let attempts =
+            futures_util::future::join_all((0..8).map(|_| pool_a.connection("edge-b", addr))).await;
+        assert!(attempts.iter().all(Result::is_err));
         assert!(pool_a.cooling_down("edge-b"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "queued requests must fail with the first attempt, not repeat it: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresponsive_connection_is_closed_and_cools_its_peer_down() {
+        let pki = TestPki::new();
+        let (pool_a, _endpoint_a) = pool(&pki, "edge-a", &["edge-b"]);
+        let (_pool_b, endpoint_b) = pool(&pki, "edge-b", &["edge-a"]);
+        let addr_b = endpoint_b.local_addr().unwrap();
+        tokio::spawn(accept_one(endpoint_b.clone()));
+
+        let connection = pool_a.connection("edge-b", addr_b).await.unwrap();
+        pool_a.connection_unresponsive("edge-b", &connection);
+        assert!(connection.close_reason().is_some());
+        assert!(pool_a.cooling_down("edge-b"));
+        assert!(pool_a.connection("edge-b", addr_b).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn only_the_closed_pooled_connection_cools_its_peer_down() {
+        let pki = TestPki::new();
+        let (pool_a, _endpoint_a) = pool(&pki, "edge-a", &["edge-b"]);
+        let (_pool_b, endpoint_b) = pool(&pki, "edge-b", &["edge-a"]);
+        let addr_b = endpoint_b.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(incoming) = endpoint_b.accept().await {
+                if let Ok(connection) = incoming.await {
+                    held.push(connection);
+                }
+            }
+        });
+
+        // A failed stream on a live connection says nothing about the peer.
+        let first = pool_a.connection("edge-b", addr_b).await.unwrap();
+        pool_a.connection_failed("edge-b", &first);
+        assert!(!pool_a.cooling_down("edge-b"));
+        let reused = pool_a.connection("edge-b", addr_b).await.unwrap();
+        assert_eq!(reused.stable_id(), first.stable_id());
+
+        // A late report about a replaced connection leaves the newer one alone.
+        first.close(0u32.into(), b"test");
+        let second = pool_a.connection("edge-b", addr_b).await.unwrap();
+        assert_ne!(second.stable_id(), first.stable_id());
+        pool_a.connection_failed("edge-b", &first);
+        assert!(!pool_a.cooling_down("edge-b"));
+        assert!(second.close_reason().is_none());
+
+        // The pooled connection closing does cool the peer down.
+        second.close(0u32.into(), b"test");
+        pool_a.connection_failed("edge-b", &second);
+        assert!(pool_a.cooling_down("edge-b"));
+        server.abort();
     }
 }

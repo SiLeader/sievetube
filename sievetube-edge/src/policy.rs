@@ -8,6 +8,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -166,7 +167,15 @@ struct BucketTable {
     name: &'static str,
     buckets: DashMap<u64, Bucket>,
     hasher: RandomState,
+    /// Clock time in milliseconds from which a full table may be swept again on
+    /// the request path. A sweep visits every bucket, so a table full of active
+    /// buckets must not be swept once for every new key.
+    next_full_sweep_ms: AtomicU64,
 }
+
+/// How often a full table is swept on the request path at most. The periodic
+/// maintenance sweep runs independently of this.
+const FULL_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 impl BucketTable {
     fn new(name: &'static str) -> Self {
@@ -174,7 +183,20 @@ impl BucketTable {
             name,
             buckets: DashMap::new(),
             hasher: RandomState::new(),
+            next_full_sweep_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Whether this caller may sweep the full table now; at most one per interval.
+    fn claim_full_sweep(&self, now: Duration) -> bool {
+        let now_ms = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
+        let next = self.next_full_sweep_ms.load(Ordering::Relaxed);
+        let after = now_ms.saturating_add(FULL_SWEEP_INTERVAL.as_millis() as u64);
+        now_ms >= next
+            && self
+                .next_full_sweep_ms
+                .compare_exchange(next, after, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
     }
 
     fn key<T: Hash>(&self, value: T) -> u64 {
@@ -194,7 +216,9 @@ impl BucketTable {
             return bucket.take(limit, amount, now);
         }
         if self.buckets.len() >= max_entries {
-            self.sweep(now, idle_ttl);
+            if self.claim_full_sweep(now) {
+                self.sweep(now, idle_ttl);
+            }
             if self.buckets.len() >= max_entries {
                 return Err(TakeError::Capacity);
             }
@@ -632,16 +656,20 @@ impl Policy {
     /// Run the plugins that apply to the request on a blocking thread.
     async fn decide_plugins(&self, ctx: &RequestContext<'_>) -> Decision {
         let plugins = self.plugins.load_full();
-        let Some(job) = plugins.prepare(ctx) else {
-            return Decision::Allow;
-        };
-        let evaluated = tokio::task::spawn_blocking(move || plugins.evaluate_prepared(&job)).await;
-        let verdict = match evaluated {
-            Ok(verdict) => verdict,
-            Err(e) => {
-                tracing::warn!(error = %e, hostname = ctx.hostname, "policy plugin evaluation did not finish");
-                return Decision::Unavailable(Reason::PluginFailure);
+        let verdict = match plugins.prepare(ctx) {
+            Ok(None) => return Decision::Allow,
+            Ok(Some(job)) => {
+                let evaluated =
+                    tokio::task::spawn_blocking(move || plugins.evaluate_prepared(&job)).await;
+                match evaluated {
+                    Ok(verdict) => verdict,
+                    Err(e) => {
+                        tracing::warn!(error = %e, hostname = ctx.hostname, "policy plugin evaluation did not finish");
+                        return Decision::Unavailable(Reason::PluginFailure);
+                    }
+                }
             }
+            Err(busy) => busy,
         };
         match verdict {
             PluginVerdict::Allow => Decision::Allow,
@@ -1150,6 +1178,33 @@ mod tests {
             .rejects());
     }
 
+    #[test]
+    fn a_full_bucket_table_is_not_swept_for_every_new_key() {
+        let table = BucketTable::new("test");
+        let limit = RateLimit {
+            per_second: 10.0,
+            burst: 1.0,
+        };
+        let idle_ttl = Duration::from_millis(100);
+        let take = |key: u64, now_ms: u64| {
+            table.take(key, limit, 1.0, Duration::from_millis(now_ms), 2, idle_ttl)
+        };
+        assert!(take(1, 0).is_ok());
+        assert!(take(2, 0).is_ok());
+        assert!(matches!(take(3, 0), Err(TakeError::Capacity)));
+
+        // The first two buckets are idle by now, but the table was swept just
+        // before; new keys are turned away without visiting every bucket.
+        assert!(matches!(take(3, 200), Err(TakeError::Capacity)));
+        assert_eq!(table.buckets.len(), 2);
+
+        assert!(
+            take(3, 1000).is_ok(),
+            "the next sweep reclaims idle buckets"
+        );
+        assert_eq!(table.buckets.len(), 1);
+    }
+
     #[tokio::test]
     async fn reload_validates_before_switching_and_keeps_buckets() {
         let mut cfg = config();
@@ -1239,11 +1294,13 @@ mod tests {
         assert!(!policy.admit_udp("u", ip, 100).rejects());
     }
 
-    fn plugin_config(name: &str, source: &str) -> crate::config::PluginConfig {
-        let path = std::env::temp_dir().join(format!(
-            "sievetube-policy-plugin-{}.wat",
-            uuid::Uuid::new_v4()
-        ));
+    /// A plugin whose module is written into `dir`.
+    fn plugin_config(
+        dir: &std::path::Path,
+        name: &str,
+        source: &str,
+    ) -> crate::config::PluginConfig {
+        let path = dir.join(format!("{name}.wat"));
         std::fs::write(&path, source).unwrap();
         crate::config::PluginConfig {
             name: name.to_string(),
@@ -1261,8 +1318,10 @@ mod tests {
     async fn a_spinning_plugin_does_not_block_the_runtime() {
         use crate::plugins::test_modules;
         let mut cfg = config();
+        let modules = crate::test_support::TempPath::dir("policy-plugins");
         // Spins until the wall-clock deadline instead of running out of fuel.
         let mut spin = plugin_config(
+            &modules,
             "spin",
             &test_modules::module(1, "(loop (br 0)) (i32.const 0)", ""),
         );
@@ -1300,7 +1359,12 @@ mod tests {
         use crate::plugins::test_modules;
         let mut cfg = config();
         cfg.blocked_cidrs = vec!["203.0.113.0/24".into()];
-        cfg.plugins = vec![plugin_config("admin", &test_modules::deny_admin_paths())];
+        let modules = crate::test_support::TempPath::dir("policy-plugins");
+        cfg.plugins = vec![plugin_config(
+            &modules,
+            "admin",
+            &test_modules::deny_admin_paths(),
+        )];
         let (policy, _clock) = policy(cfg.clone());
 
         let mut admin = ctx("t", "a.test", "192.0.2.1");
@@ -1328,6 +1392,7 @@ mod tests {
         // A plugin that traps fails the request instead of allowing it.
         let mut failing = cfg.clone();
         failing.plugins = vec![plugin_config(
+            &modules,
             "crash",
             &test_modules::module(1, "(unreachable)", ""),
         )];
@@ -1343,6 +1408,7 @@ mod tests {
         // An invalid plugin is rejected and the running set stays.
         let mut broken = cfg;
         broken.plugins = vec![plugin_config(
+            &modules,
             "v9",
             &test_modules::module(9, "(i32.const 0)", ""),
         )];

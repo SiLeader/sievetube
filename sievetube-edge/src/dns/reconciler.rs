@@ -718,8 +718,8 @@ mod tests {
         )
     }
 
-    fn tempdir() -> PathBuf {
-        std::env::temp_dir().join(format!("sievetube-dns-{}", uuid::Uuid::new_v4()))
+    fn tempdir() -> crate::test_support::TempPath {
+        crate::test_support::TempPath::new("dns")
     }
 
     fn values(set: Option<RecordSet>) -> Vec<String> {
@@ -939,7 +939,7 @@ mod tests {
             };
             DnsReconciler::new(
                 ReconcilerSettings {
-                    state_dir: dir.clone(),
+                    state_dir: dir.to_path_buf(),
                     interval: Duration::from_secs(60),
                     settle_secs: 0,
                     lease_ttl: Duration::from_secs(30),

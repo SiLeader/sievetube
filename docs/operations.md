@@ -7,6 +7,7 @@ Edge/Connectorの設定項目は[config/edge.example.toml](../config/edge.exampl
 * 設定はEdgeの起動時に検証されます。値が不正な場合は起動しません（黙って既定値へ戻したり、機能を無効化したりしません）。
 * `SIGHUP` で設定ファイルを読み直します。反映されるのは `[policy]`（プラグインを含む）とBYOC証明書です。読み込みや検証に失敗した場合は、稼働中の設定をそのまま維持します。それ以外の項目は再起動が必要です。
 * `SIGTERM` / `Ctrl-C` で新規受付を停止し、`server.drain_timeout_secs` の間だけ処理中の接続を待ってから終了します。
+* Connectorも `SIGTERM` / `Ctrl-C` で停止処理に入ります。各Edgeへ停止を通知し、処理中のストリームが終わるか `network.drain_timeout_secs`（既定10秒）が過ぎてから接続を閉じます。通知を受けたEdgeはそのConnectorへ新しい通信を割り当てません。通知に対応していない旧バージョンのEdgeは、接続が閉じるまで割り当てを続けます。
 * Edgeが保持するConnector接続はテナント（トークンの `sub`）ごとに1本です。同じEdgeへ同じテナントの新しい接続が来ると、古い接続は閉じられます。同じトークンで複数のConnectorを動かす場合は、それぞれ別のEdgeへ接続させてください。同じEdgeに接続すると互いに接続を奪い合うため、置き換えられたConnectorは警告をログに出し、60秒待ってから再接続します。
 * 機能はすべて既定で無効です。`[policy]`・`[tls.acme]`・`[dns]` は `enabled = true`、Edge間転送は `routing.mode = "mesh"` で有効になります。
 
@@ -29,6 +30,8 @@ Edge/Connectorの設定項目は[config/edge.example.toml](../config/edge.exampl
 * `sievetube_dns_records{status}`, `sievetube_dns_changes_total{provider_type,result}`, `sievetube_dns_last_reconcile_timestamp_seconds`
 * `sievetube_mesh_forwarded_total{protocol,stage}`, `sievetube_mesh_rejected_total{reason}`, `sievetube_mesh_routes`, `sievetube_mesh_peers`
 * `sievetube_udp_dropped_total{reason}`
+
+`sievetube_tls_certificate_min_remaining_seconds{source}` は、証明書が1枚もない `source` については出力されません。値が0の系列は、期限切れを迎えた証明書を表します。
 
 ## 3. 証明書
 
@@ -58,7 +61,7 @@ Edge/Connectorの設定項目は[config/edge.example.toml](../config/edge.exampl
 
 上限はEdgeごとです。複数Edgeへ分散すると全体の許容量は台数倍になります。
 
-Wasmプラグインは `sha256` が一致するモジュールだけを読み込み、インポートを持つモジュールは拒否します。実行はメモリ・燃料・時間・同時実行数で制限され、trapやタイムアウトは該当リクエストのみ503になります。読み込みに失敗した場合は直前のプラグイン構成を維持するため、`SIGHUP` による切り戻しは高速です。
+Wasmプラグインは `sha256` が一致するモジュールだけを読み込み、インポートを持つモジュールは拒否します。実行はメモリ・燃料・時間・同時実行数で制限され、trapやタイムアウトは該当リクエストのみ503になります。同時実行数の上限に達したプラグインは、実行待ちの列を作らずにそのリクエストを503にします。読み込みに失敗した場合は直前のプラグイン構成を維持するため、`SIGHUP` による切り戻しは高速です。
 
 ## 5. DNSレコード
 
@@ -96,7 +99,9 @@ sievetube-edge mesh-cert /etc/sievetube/mesh edge-b
 
 * 複数Edgeのmesh構成では、Valkey・固定のEdge ID・相互認証用の証明書・到達可能な `advertise` アドレスが必須です。不足している場合は設定エラーとして起動しません（暗黙にdirectへ切り替わることはありません）。
 * Valkeyが停止すると、新しい経路広告と新規のホスト名所有権取得は止まります。既存の経路はTTLが切れるまで使え、ローカルConnectorへの転送は影響を受けません。
-* 転送先Edgeが停止すると、その経路はTTL後に消え、失敗したpeerは一定時間候補から外れます。応答開始前の失敗は502、トンネル確保のタイムアウトは504になります。
+* 転送先Edgeが停止すると、その経路はTTL後に消えます。接続に失敗したpeerと、転送要求を送ったあとQUICの確認応答すら返さなくなったpeerは、接続を閉じたうえで `peer_failure_cooldown_secs` の間候補から外れます。応答開始前の失敗は502、トンネル確保のタイムアウトは504になります。
+* 転送元は、応答を待つ残り時間（`accept_timeout_ms` から算出）を転送要求に含めます。転送先はそこから往復時間を差し引いた時間内に、受け入れるか拒否するかを返します。混雑しているだけのEdgeは期限内に拒否を返すため、転送元はそのEdgeを障害扱いせずに次の候補を試します。この情報を送らない旧バージョンのEdgeからの要求には、転送先は自身の `accept_timeout_ms` を基準にします。
+* 停止処理中のEdgeは、処理中のストリームを維持したまま、新しい転送要求を即座に拒否します。
 * 既存のストリームは障害時に引き継げません。新規接続は経路が回復した時点で成功します。
 * UDPは「1要求1応答」のみを転送します。サイズ超過のデータグラムは破棄して `sievetube_udp_dropped_total{reason="oversize"}` に計上します。
 * UDPの転送は受信ループの外で行うため、リスナーごとの同時転送数（1024）を超えた分は `reason="forward_backlog"` として破棄します。応答は転送先のpeerからのみ受け付け、他のpeerからの応答は `reason="reply_peer_mismatch"` に計上します。

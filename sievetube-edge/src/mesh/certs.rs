@@ -166,22 +166,18 @@ impl MeshIdentity {
 
 #[cfg(test)]
 pub mod test_pki {
-    use std::path::PathBuf;
-
     use super::*;
 
-    /// A CA directory with certificates for the given edges.
+    /// A CA directory with certificates for the given edges, removed on drop.
     pub struct TestPki {
-        pub dir: PathBuf,
+        pub dir: crate::test_support::TempPath,
         pub ca_cert: String,
         pub ca_key: String,
     }
 
     impl TestPki {
         pub fn new() -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("sievetube-mesh-pki-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = crate::test_support::TempPath::dir("mesh-pki");
             let (ca_cert, ca_key) = generate_ca("sievetube test mesh CA").unwrap();
             std::fs::write(dir.join("ca.pem"), &ca_cert).unwrap();
             TestPki {

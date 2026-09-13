@@ -8,6 +8,7 @@ use sievetube_common::auth::verify_jwt;
 use sievetube_common::config::Protocol;
 use sievetube_common::error::app_error;
 use sievetube_common::hostname::{self, HostnameError};
+use sievetube_common::mesh_protocol::MAX_ID_LEN;
 use sievetube_common::protocol::{
     self, AuthRequest, AuthResponse, Message, ServiceAdvertisement, ALPN_PROTOCOL,
 };
@@ -20,6 +21,11 @@ use crate::valkey::{ClaimOutcome, ValkeyHandle};
 
 /// Maximum time for a Connector to complete authentication after connecting.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Data a Connector may send on its connection beyond what was passed on to
+/// public clients, over all streams together. Each stream buffers up to its own
+/// window, so without this bound slow-reading clients on thousands of streams
+/// could make one connection buffer gigabytes.
+const RECEIVE_WINDOW: u32 = 128 * 1024 * 1024;
 
 /// Shared state for Connector connection handling.
 pub struct QuicContext {
@@ -76,6 +82,7 @@ pub fn build_endpoint(
 
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(10_000u32.into());
+    transport.receive_window(RECEIVE_WINDOW.into());
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
     transport.datagram_receive_buffer_size(Some(65535));
 
@@ -162,6 +169,13 @@ async fn handle_connector(connection: quinn::Connection, ctx: Arc<QuicContext>) 
     };
 
     let tenant_id = claims.sub.clone();
+    if ctx.advertiser.is_some() {
+        if let Err(e) = check_mesh_tenant_id(&tenant_id) {
+            tracing::warn!(remote_addr = %remote, error = e, "tenant id unusable for mesh forwarding");
+            reject(&connection, e.to_string(), b"auth failed").await;
+            return;
+        }
+    }
     let hostnames = match normalize_claimed_hostnames(&claims.hostnames) {
         Ok(hostnames) => hostnames,
         Err(e) => {
@@ -228,6 +242,9 @@ async fn handle_connector(connection: quinn::Connection, ctx: Arc<QuicContext>) 
         }
     };
     let handle = registered.handle;
+    // Registered Connectors receive UDP traffic from now on, so their replies
+    // have to be read before anything below waits on the control plane.
+    tokio::spawn(tunnel::udp_reply_loop(connection.clone(), udp_reply_map));
     // The replaced connection receives no traffic any more; without closing it,
     // its Connector would keep believing it is serving and the connection would
     // stay open, since both sides keep it alive.
@@ -255,17 +272,18 @@ async fn handle_connector(connection: quinn::Connection, ctx: Arc<QuicContext>) 
         advertiser.advertise_now().await;
     }
 
-    // Spawn UDP reply loop for this connector connection
-    {
-        let conn = connection.clone();
-        tokio::spawn(async move {
-            tunnel::udp_reply_loop(conn, udp_reply_map).await;
-        });
-    }
-
-    // Wait for the connection to close
-    let close_reason = connection.closed().await;
-    tracing::info!(tenant_id, reason = ?close_reason, "connector disconnected");
+    // A Connector that shuts down announces it first: it gets no new traffic
+    // from then on, while the streams in flight finish before it closes.
+    let going_away = tokio::select! {
+        close_reason = connection.closed() => {
+            tracing::info!(tenant_id, reason = ?close_reason, "connector disconnected");
+            false
+        }
+        () = wait_for_going_away(&connection) => {
+            tracing::info!(tenant_id, "connector is going away; draining its streams");
+            true
+        }
+    };
 
     // Only the current generation may deregister; a newer connection keeps its routes.
     if ctx.registry.remove(&tenant_id, handle.generation) {
@@ -278,6 +296,32 @@ async fn handle_connector(connection: quinn::Connection, ctx: Arc<QuicContext>) 
             }
         }
     }
+    if going_away {
+        let close_reason = connection.closed().await;
+        tracing::info!(tenant_id, reason = ?close_reason, "connector disconnected");
+    }
+}
+
+/// Resolves when the Connector announces that it is going away. Streams it
+/// opens for anything else are ignored; a connection that closes never resolves.
+async fn wait_for_going_away(connection: &quinn::Connection) {
+    while let Ok(mut recv) = connection.accept_uni().await {
+        let message = tokio::time::timeout(AUTH_TIMEOUT, protocol::read_message(&mut recv)).await;
+        if let Ok(Ok(Message::GoingAway)) = message {
+            return;
+        }
+    }
+    std::future::pending().await
+}
+
+/// Mesh messages carry the tenant id, and peers refuse ids that are empty or
+/// longer than [`MAX_ID_LEN`]. A Connector with such an id would only be
+/// reachable through the Edge it is connected to, so it is refused up front.
+fn check_mesh_tenant_id(tenant_id: &str) -> Result<(), &'static str> {
+    if tenant_id.is_empty() || tenant_id.len() > MAX_ID_LEN {
+        return Err("the token's sub claim must be between 1 and 256 bytes for mesh routing");
+    }
+    Ok(())
 }
 
 fn normalize_claimed_hostnames(raw: &[String]) -> Result<Vec<String>, HostnameError> {
@@ -344,6 +388,48 @@ mod tests {
                 .unwrap();
         assert_eq!(hostnames, vec!["a.test", "b.test"]);
         assert!(normalize_claimed_hostnames(&["bad host".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn going_away_is_recognized_among_other_streams() {
+        let pair = crate::test_support::quic_pair().await;
+        let waiting = tokio::spawn({
+            let server = pair.server.clone();
+            async move { wait_for_going_away(&server).await }
+        });
+
+        // Anything else on a unidirectional stream is not a notice.
+        let mut other = pair.client.open_uni().await.unwrap();
+        protocol::write_message(
+            &mut other,
+            &Message::AuthResponse(AuthResponse {
+                ok: true,
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        other.finish().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished());
+
+        let mut notice = pair.client.open_uni().await.unwrap();
+        protocol::write_message(&mut notice, &Message::GoingAway)
+            .await
+            .unwrap();
+        notice.finish().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the notice is recognized")
+            .unwrap();
+    }
+
+    #[test]
+    fn mesh_tenant_ids_fit_into_mesh_messages() {
+        assert!(check_mesh_tenant_id("tenant-1").is_ok());
+        assert!(check_mesh_tenant_id(&"t".repeat(MAX_ID_LEN)).is_ok());
+        assert!(check_mesh_tenant_id("").is_err());
+        assert!(check_mesh_tenant_id(&"t".repeat(MAX_ID_LEN + 1)).is_err());
     }
 
     #[test]

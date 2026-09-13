@@ -72,8 +72,15 @@ static LEASE_RELEASE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
 
 /// Replace every route belonging to one Edge and refresh the desired set.
 ///
-/// KEYS: routes zset.
-/// ARGV: notification channel, edge id, now ms, expiry ms, locally-changed flag,
+/// Replaces this Edge's advertised routes.
+///
+/// Each Edge keeps the members it advertised in a set of its own, so replacing
+/// its routes touches only those instead of decoding every route of every Edge
+/// on each refresh. The set expires with the routes, so that of a crashed Edge
+/// disappears on its own.
+///
+/// KEYS: routes zset, this Edge's member set.
+/// ARGV: notification channel, now ms, expiry ms, ttl ms, locally-changed flag,
 /// serialized ads...
 static ROUTES_REPLACE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
     redis::Script::new(
@@ -83,16 +90,19 @@ for i = 6, #ARGV do
   desired[ARGV[i]] = true
 end
 local removed = 0
-local existing = redis.call('ZRANGE', KEYS[1], 0, -1)
-for _, member in ipairs(existing) do
-  local ok, ad = pcall(cjson.decode, member)
-  if ok and ad['e'] == ARGV[2] and not desired[member] then
+for _, member in ipairs(redis.call('SMEMBERS', KEYS[2])) do
+  if not desired[member] then
     removed = removed + redis.call('ZREM', KEYS[1], member)
+    redis.call('SREM', KEYS[2], member)
   end
 end
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[3])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[2])
 for i = 6, #ARGV do
-  redis.call('ZADD', KEYS[1], ARGV[4], ARGV[i])
+  redis.call('ZADD', KEYS[1], ARGV[3], ARGV[i])
+  redis.call('SADD', KEYS[2], ARGV[i])
+end
+if #ARGV >= 6 then
+  redis.call('PEXPIRE', KEYS[2], ARGV[4])
 end
 if removed > 0 or ARGV[5] == '1' then
   redis.call('PUBLISH', ARGV[1], 'routes')
@@ -562,6 +572,11 @@ fn mesh_edge_key(edge_id: &str) -> String {
     format!("sievetube:mesh:edge:{edge_id}")
 }
 
+/// Members of [`MESH_ROUTES_KEY`] advertised by one Edge.
+fn mesh_edge_routes_key(edge_id: &str) -> String {
+    format!("sievetube:mesh:edge:{edge_id}:routes")
+}
+
 impl ValkeyHandle {
     /// Publish how peers can reach this Edge. Expires unless refreshed.
     pub async fn publish_edge_info(
@@ -633,13 +648,15 @@ impl ValkeyHandle {
         let digest = digest_members(&members);
         let changed = *self.published_routes() != Some(digest);
 
+        let ttl_ms = ttl.as_millis() as u64;
         let mut invocation = ROUTES_REPLACE_SCRIPT.prepare_invoke();
         invocation
             .key(MESH_ROUTES_KEY)
+            .key(mesh_edge_routes_key(&self.inner.edge_id))
             .arg(MESH_ROUTES_CHANNEL)
-            .arg(&self.inner.edge_id)
             .arg(now)
-            .arg(now + ttl.as_millis() as u64)
+            .arg(now + ttl_ms)
+            .arg(ttl_ms)
             .arg(if changed && !ads.is_empty() { 1 } else { 0 });
         for member in &members {
             invocation.arg(member);
@@ -664,10 +681,12 @@ impl ValkeyHandle {
         let mut conn = self.connection()?;
         let mut pipe = redis::pipe();
         pipe.atomic();
+        let own = mesh_edge_routes_key(&self.inner.edge_id);
         for ad in ads {
             let member = serde_json::to_string(ad)
                 .map_err(|e| ControlPlaneError::Unavailable(e.to_string()))?;
-            pipe.zrem(MESH_ROUTES_KEY, member);
+            pipe.zrem(MESH_ROUTES_KEY, &member);
+            pipe.srem(&own, member);
         }
         pipe.publish(MESH_ROUTES_CHANNEL, "routes");
         pipe.query_async::<()>(&mut conn).await?;
@@ -878,6 +897,19 @@ mod tests {
             generation,
         };
         let keep = make_ad("keep.test", 2);
+        // Another Edge's route must survive this Edge replacing its own.
+        let other_id = format!("route-other-{}", uuid::Uuid::new_v4());
+        let other = ValkeyHandle::new(&url, &other_id).unwrap();
+        other.try_connect().await.unwrap();
+        let foreign = RouteAd {
+            edge_id: other_id.clone(),
+            ..make_ad("keep.test", 1)
+        };
+        other
+            .publish_routes(std::slice::from_ref(&foreign), Duration::from_secs(30))
+            .await
+            .unwrap();
+
         edge.publish_routes(
             &[make_ad("keep.test", 1), make_ad("stale.test", 1)],
             Duration::from_secs(30),
@@ -888,25 +920,43 @@ mod tests {
             .await
             .unwrap();
 
-        let routes: Vec<RouteAd> = edge
-            .fetch_routes()
+        let routes_of = |routes: Vec<(RouteAd, u64)>, id: &str| -> Vec<RouteAd> {
+            routes
+                .into_iter()
+                .map(|(ad, _)| ad)
+                .filter(|ad| ad.edge_id == id)
+                .collect()
+        };
+        let routes = edge.fetch_routes().await.unwrap();
+        assert_eq!(routes_of(routes.clone(), &edge_id), vec![keep.clone()]);
+        assert_eq!(routes_of(routes, &other_id), vec![foreign.clone()]);
+
+        // A withdrawn route stays withdrawn when the rest is published again.
+        let extra = make_ad("extra.test", 2);
+        edge.publish_routes(&[keep.clone(), extra.clone()], Duration::from_secs(30))
             .await
-            .unwrap()
-            .into_iter()
-            .map(|(ad, _)| ad)
-            .filter(|ad| ad.edge_id == edge_id)
-            .collect();
-        assert_eq!(routes, vec![keep]);
+            .unwrap();
+        edge.withdraw_routes(std::slice::from_ref(&extra))
+            .await
+            .unwrap();
+        edge.publish_routes(std::slice::from_ref(&keep), Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(
+            routes_of(edge.fetch_routes().await.unwrap(), &edge_id),
+            vec![keep]
+        );
 
         edge.publish_routes(&[], Duration::from_secs(30))
             .await
             .unwrap();
-        assert!(edge
-            .fetch_routes()
+        let routes = edge.fetch_routes().await.unwrap();
+        assert!(routes_of(routes.clone(), &edge_id).is_empty());
+        assert_eq!(routes_of(routes, &other_id), vec![foreign]);
+        other
+            .publish_routes(&[], Duration::from_secs(30))
             .await
-            .unwrap()
-            .into_iter()
-            .all(|(ad, _)| ad.edge_id != edge_id));
+            .unwrap();
         drop(base);
     }
 

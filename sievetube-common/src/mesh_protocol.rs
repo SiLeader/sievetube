@@ -48,6 +48,12 @@ pub struct ForwardRequest {
     pub hops_remaining: u8,
     /// Connector registration generation the route was advertised for
     pub connection_generation: u64,
+    /// How long the ingress Edge waits for the [`ForwardResponse`] from when it
+    /// sent the request, in milliseconds. The receiving Edge answers within it,
+    /// net of the round trip, so that a rejection still arrives in time. Absent
+    /// in requests from Edges that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_budget_ms: Option<u64>,
 }
 
 impl ForwardRequest {
@@ -316,6 +322,7 @@ mod tests {
             request_id: 7,
             hops_remaining: 1,
             connection_generation: 3,
+            response_budget_ms: Some(2900),
         }
     }
 
@@ -332,6 +339,17 @@ mod tests {
         assert_eq!(response.reject, Some(RejectReason::NoRoute));
         assert!(RejectReason::NoRoute.retryable());
         assert!(!RejectReason::NotAuthorized.retryable());
+    }
+
+    #[test]
+    fn response_budget_is_optional_in_both_directions() {
+        // A request from an Edge that predates the budget.
+        let mut older = serde_json::to_value(request()).unwrap();
+        older.as_object_mut().unwrap().remove("response_budget_ms");
+        let parsed: ForwardRequest = serde_json::from_value(older.clone()).unwrap();
+        assert_eq!(parsed.response_budget_ms, None);
+        // A request without a budget serializes exactly as before it existed.
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), older);
     }
 
     #[tokio::test]

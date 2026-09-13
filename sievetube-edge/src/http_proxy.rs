@@ -611,6 +611,7 @@ fn build_backend_request<B>(
     parts.version = Version::HTTP_11;
 
     strip_hop_by_hop(&mut parts.headers);
+    join_cookie_fields(&mut parts.headers);
     parts.headers.insert(
         header::HOST,
         HeaderValue::from_str(authority)
@@ -626,6 +627,25 @@ fn build_backend_request<B>(
         apply_forwarded_headers(&mut parts.headers, forwarded, scheme);
     }
     Ok(Request::from_parts(parts, body))
+}
+
+/// Join the `cookie` fields of a request into one. HTTP/2 clients send cookies
+/// as separate fields, and an HTTP/1.1 backend may read only the first of them
+/// (RFC 9113 §8.2.3).
+fn join_cookie_fields(headers: &mut HeaderMap) {
+    let mut values = headers.get_all(header::COOKIE).iter();
+    if values.next().is_none() || values.next().is_none() {
+        return;
+    }
+    let mut joined = Vec::new();
+    for value in headers.get_all(header::COOKIE) {
+        if !joined.is_empty() {
+            joined.extend_from_slice(b"; ");
+        }
+        joined.extend_from_slice(value.as_bytes());
+    }
+    let joined = HeaderValue::from_bytes(&joined).expect("joined header values stay valid");
+    headers.insert(header::COOKIE, joined);
 }
 
 /// Set X-Forwarded-For / X-Forwarded-Proto. Values supplied by untrusted peers
@@ -761,6 +781,29 @@ mod tests {
         assert_eq!(backend.headers()["x-forwarded-for"], "203.0.113.7");
         assert_eq!(backend.headers()["x-forwarded-proto"], "https");
         assert!(!backend.headers().contains_key("te"));
+    }
+
+    #[test]
+    fn cookie_fields_of_http2_requests_are_joined() {
+        let req = Request::builder()
+            .uri("https://a.test/")
+            .version(Version::HTTP_2)
+            .header("cookie", "session=abc")
+            .header("cookie", "csrf=def")
+            .header("cookie", "theme=dark")
+            .body(())
+            .unwrap();
+        let backend = build_backend_request(req, "a.test", Scheme::Https, None, None).unwrap();
+        let cookies: Vec<_> = backend.headers().get_all("cookie").iter().collect();
+        assert_eq!(cookies, ["session=abc; csrf=def; theme=dark"]);
+
+        let req = Request::builder()
+            .uri("/")
+            .header("cookie", "session=abc; csrf=def")
+            .body(())
+            .unwrap();
+        let backend = build_backend_request(req, "a.test", Scheme::Http, None, None).unwrap();
+        assert_eq!(backend.headers()["cookie"], "session=abc; csrf=def");
     }
 
     #[test]

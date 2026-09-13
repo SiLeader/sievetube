@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let drain_timeout = std::time::Duration::from_secs(cfg.network.drain_timeout_secs);
 
     // How the Edge's certificate is checked (CA, pinning, or not at all).
     let verification = || {
@@ -92,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Spawn a connection task for each public server (full-mesh topology)
+    let connections = tokio_util::task::TaskTracker::new();
     for server in &cfg.network.public_servers {
         let server = server.clone();
         let jwt = cfg.auth.token.clone();
@@ -102,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
 
         let edge_verification = verification()?;
         let server_name = cfg.network.edge_server_name.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             quic_client::run_connection(
                 server,
                 jwt,
@@ -111,11 +113,13 @@ async fn main() -> anyhow::Result<()> {
                 tid,
                 edge_verification,
                 server_name,
+                drain_timeout,
                 shutdown,
             )
             .await;
         });
     }
+    connections.close();
 
     // Health/metrics server
     let health_addr =
@@ -126,14 +130,45 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("shutdown signal received, closing connections...");
+    wait_for_shutdown_signal().await;
+    tracing::info!("shutdown signal received, draining connections...");
     let _ = shutdown_tx.send(true);
 
-    // Give connections a moment to drain
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // Each connection tells its Edge to stop sending new traffic and closes once
+    // its streams finished or its drain timeout passed.
+    let grace = drain_timeout + std::time::Duration::from_secs(5);
+    if tokio::time::timeout(grace, connections.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!("connections did not close in time");
+    }
     tracing::info!("exiting");
     Ok(())
+}
+
+/// SIGTERM (service managers, container runtimes) or Ctrl-C.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; only Ctrl-C stops the connector gracefully");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Decode the claims from a JWT payload without verifying the signature.

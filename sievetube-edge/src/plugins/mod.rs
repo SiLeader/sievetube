@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use serde::Serialize;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
 
 use sievetube_common::hostname;
@@ -149,6 +149,9 @@ struct PluginInput<'a> {
 pub struct PluginJob {
     hostname: String,
     input: Vec<u8>,
+    /// A concurrency slot of every plugin that applies, taken before the job
+    /// is handed to a blocking thread
+    _permits: Vec<OwnedSemaphorePermit>,
 }
 
 /// The plugins of one policy configuration, evaluated in order.
@@ -224,13 +227,27 @@ impl PluginSet {
         Ok(PluginSet { plugins })
     }
 
-    /// Serialize the request for the plugins that apply to it, or `None` when no
-    /// plugin does. Cheap, so it can run on the caller's thread.
-    pub fn prepare(&self, ctx: &RequestContext<'_>) -> Option<PluginJob> {
-        if !self.plugins.iter().any(|p| p.applies(ctx.hostname)) {
-            return None;
+    /// Serialize the request for the plugins that apply to it, or `Ok(None)`
+    /// when no plugin does. Cheap, so it can run on the caller's thread.
+    ///
+    /// The concurrency slots are taken here: a plugin at its limit fails the
+    /// request at once, instead of queueing work for the blocking thread pool
+    /// without bound.
+    pub fn prepare(&self, ctx: &RequestContext<'_>) -> Result<Option<PluginJob>, PluginVerdict> {
+        let mut permits = Vec::new();
+        for plugin in self.plugins.iter().filter(|p| p.applies(ctx.hostname)) {
+            let Ok(permit) = plugin.permits.clone().try_acquire_owned() else {
+                return Err(PluginVerdict::Failed {
+                    plugin: plugin.name.clone(),
+                    failure: PluginFailure::Busy,
+                });
+            };
+            permits.push(permit);
         }
-        Some(PluginJob {
+        if permits.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PluginJob {
             hostname: ctx.hostname.to_string(),
             input: serde_json::to_vec(&PluginInput {
                 tenant_id: ctx.tenant_id,
@@ -241,7 +258,8 @@ impl PluginSet {
                 path: ctx.path,
             })
             .expect("request context serializes"),
-        })
+            _permits: permits,
+        }))
     }
 
     /// Run the applicable plugins. Every call is CPU work with a wall-clock
@@ -276,8 +294,9 @@ impl PluginSet {
     #[cfg(test)]
     pub fn evaluate(&self, ctx: &RequestContext<'_>) -> PluginVerdict {
         match self.prepare(ctx) {
-            Some(job) => self.evaluate_prepared(&job),
-            None => PluginVerdict::Allow,
+            Ok(Some(job)) => self.evaluate_prepared(&job),
+            Ok(None) => PluginVerdict::Allow,
+            Err(verdict) => verdict,
         }
     }
 }
@@ -309,14 +328,12 @@ impl LoadedPlugin {
         })
     }
 
-    /// Run `f` against a fresh instance with this plugin's limits.
+    /// Run `f` against a fresh instance with this plugin's limits. Requests
+    /// take a concurrency slot before, see [`PluginSet::prepare`].
     fn invoke(
         &self,
         f: impl FnOnce(&mut Store<StoreLimits>, &Instance) -> wasmtime::Result<i32>,
     ) -> Result<i32, PluginFailure> {
-        let Ok(_permit) = self.permits.try_acquire() else {
-            return Err(PluginFailure::Busy);
-        };
         let limits = StoreLimitsBuilder::new()
             .memory_size(self.max_memory_bytes)
             .instances(1)
@@ -477,7 +494,12 @@ mod tests {
         }
     }
 
+    /// Load the plugins and remove their module files, which are only read here.
     fn load(configs: &[PluginConfig]) -> anyhow::Result<PluginSet> {
+        let _files: Vec<_> = configs
+            .iter()
+            .map(|cfg| crate::test_support::TempPath::adopt(&cfg.path))
+            .collect();
         PluginSet::load(configs, &ModuleCache::default())
     }
 
@@ -612,9 +634,31 @@ mod tests {
     }
 
     #[test]
+    fn prepared_jobs_hold_their_slots_until_dropped() {
+        let mut cfg = config("single", &allow_all());
+        cfg.max_concurrent = 1;
+        let set = load(&[cfg]).unwrap();
+        let request = ctx("a.test", "/");
+
+        let queued = set.prepare(&request).unwrap().expect("the plugin applies");
+        assert_eq!(
+            set.prepare(&request).err(),
+            Some(PluginVerdict::Failed {
+                plugin: "single".into(),
+                failure: PluginFailure::Busy
+            }),
+            "a job waiting for a thread already counts against the limit"
+        );
+        assert_eq!(set.evaluate_prepared(&queued), PluginVerdict::Allow);
+        drop(queued);
+        assert!(set.prepare(&request).unwrap().is_some());
+    }
+
+    #[test]
     fn module_cache_reuses_compiled_modules() {
         let cache = ModuleCache::default();
         let cfg = config("allow", &allow_all());
+        let _file = crate::test_support::TempPath::adopt(&cfg.path);
         PluginSet::load(std::slice::from_ref(&cfg), &cache).unwrap();
         PluginSet::load(std::slice::from_ref(&cfg), &cache).unwrap();
         assert_eq!(cache.modules.lock().unwrap().len(), 1);

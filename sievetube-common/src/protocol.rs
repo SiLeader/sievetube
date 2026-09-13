@@ -10,6 +10,8 @@
 /// 2. Edge replies on a unidirectional stream with AuthResponse.
 /// 3. For each inbound connection, Edge opens a bidirectional QUIC stream,
 ///    sends ConnectRequest, then the stream becomes a raw byte pipe.
+/// 4. A Connector that shuts down sends GoingAway on a new unidirectional
+///    stream, lets the streams in flight finish and then closes the connection.
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -24,6 +26,7 @@ pub const MAX_FRAME_SIZE: u32 = 64 * 1024; // 64 KiB for control frames
 const TAG_AUTH_REQUEST: u8 = 0x01;
 const TAG_AUTH_RESPONSE: u8 = 0x02;
 const TAG_CONNECT_REQUEST: u8 = 0x03;
+const TAG_GOING_AWAY: u8 = 0x04;
 
 /// Sent by Connector → Edge to authenticate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +66,10 @@ pub enum Message {
     AuthRequest(AuthRequest),
     AuthResponse(AuthResponse),
     ConnectRequest(ConnectRequest),
+    /// Sent by Connector → Edge: route no new traffic to this connection.
+    /// Edges that predate it never read the stream it arrives on, so it is safe
+    /// to send to any Edge.
+    GoingAway,
 }
 
 pub async fn write_message<W: AsyncWrite + Unpin>(
@@ -73,6 +80,7 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
         Message::AuthRequest(m) => (TAG_AUTH_REQUEST, serde_json::to_vec(m).unwrap()),
         Message::AuthResponse(m) => (TAG_AUTH_RESPONSE, serde_json::to_vec(m).unwrap()),
         Message::ConnectRequest(m) => (TAG_CONNECT_REQUEST, serde_json::to_vec(m).unwrap()),
+        Message::GoingAway => (TAG_GOING_AWAY, b"{}".to_vec()),
     };
 
     let total_len = 1 + payload.len(); // tag byte + payload
@@ -119,6 +127,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Messag
                 .map_err(|e| SieveTubeError::Protocol(e.to_string()))?;
             Message::ConnectRequest(m)
         }
+        TAG_GOING_AWAY => Message::GoingAway,
         _ => {
             return Err(SieveTubeError::Protocol(format!(
                 "unknown message tag: 0x{tag:02x}"
@@ -237,6 +246,14 @@ mod tests {
             decoded,
             Message::ConnectRequest(ConnectRequest { request_id: 42, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn round_trip_going_away() {
+        let mut buf = Vec::new();
+        write_message(&mut buf, &Message::GoingAway).await.unwrap();
+        let decoded = read_message(&mut Cursor::new(buf)).await.unwrap();
+        assert!(matches!(decoded, Message::GoingAway));
     }
 
     #[test]

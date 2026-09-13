@@ -1,3 +1,5 @@
+use std::hash::{BuildHasher, Hasher};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,16 +9,35 @@ use sievetube_common::hostname;
 use sievetube_common::protocol::{
     self, AuthRequest, DatagramHeader, Message, ServiceAdvertisement, ALPN_PROTOCOL,
 };
+use tokio::sync::watch;
+use tokio::time::Instant;
+use tokio_util::task::TaskTracker;
 
 use crate::ingress::IngressMatcher;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// An authenticated session that lasted this long proves the Edge usable, so
+/// the next reconnect starts over from the initial backoff. Sessions that end
+/// sooner keep backing off, so that an Edge or middlebox dropping Connectors
+/// right after authentication is not reconnected to every second.
+const STABLE_SESSION: Duration = Duration::from_secs(60);
 /// Wait after another Connector with the same token took over this Edge
 /// connection. Reconnecting sooner would take it back and cut its streams.
 const REPLACED_RETRY_DELAY: Duration = Duration::from_secs(60);
 /// Streams the Edge may open at once; it opens one per HTTP request and tunnel.
 const MAX_INCOMING_STREAMS: u32 = 10_000;
+/// Data the Edge may send on a connection beyond what was passed on to local
+/// targets, over all streams together. Each stream buffers up to its own
+/// window, so without this bound thousands of streams to a target that reads
+/// slowly could buffer gigabytes. It matches the memory the default limit of
+/// 100 streams allowed before.
+const RECEIVE_WINDOW: u32 = 128 * 1024 * 1024;
+/// How long connecting to one address of an Edge may take before the next one
+/// is tried.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long sending the going-away notice may take during shutdown.
+const GOING_AWAY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum time for the Edge to deliver a stream's ConnectRequest.
 const CONNECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// UDP datagrams forwarded to local targets at once; each holds a socket while
@@ -59,8 +80,40 @@ impl EdgeVerification {
     }
 }
 
-/// Build a QUIC client endpoint for connecting to Edges.
-fn build_endpoint(verification: EdgeVerification) -> anyhow::Result<quinn::Endpoint> {
+/// Client endpoints for connecting to Edges, one per address family and bound
+/// on first use. Edges are reachable over IPv4 and IPv6 alike, without relying
+/// on the platform's support for dual-stack sockets.
+struct EdgeEndpoints {
+    config: quinn::ClientConfig,
+    v4: Option<quinn::Endpoint>,
+    v6: Option<quinn::Endpoint>,
+}
+
+impl EdgeEndpoints {
+    fn new(verification: EdgeVerification) -> anyhow::Result<Self> {
+        Ok(EdgeEndpoints {
+            config: client_config(verification)?,
+            v4: None,
+            v6: None,
+        })
+    }
+
+    fn for_addr(&mut self, addr: SocketAddr) -> std::io::Result<&quinn::Endpoint> {
+        let (slot, bind) = match addr {
+            SocketAddr::V4(_) => (&mut self.v4, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))),
+            SocketAddr::V6(_) => (&mut self.v6, SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))),
+        };
+        if slot.is_none() {
+            let mut endpoint = quinn::Endpoint::client(bind)?;
+            endpoint.set_default_client_config(self.config.clone());
+            *slot = Some(endpoint);
+        }
+        Ok(slot.as_ref().expect("endpoint bound above"))
+    }
+}
+
+/// Build the QUIC client configuration for connecting to Edges.
+fn client_config(verification: EdgeVerification) -> anyhow::Result<quinn::ClientConfig> {
     let builder = rustls::ClientConfig::builder();
     let mut crypto = match verification {
         EdgeVerification::Ca(roots) => builder.with_root_certificates(roots).with_no_client_auth(),
@@ -81,14 +134,27 @@ fn build_endpoint(verification: EdgeVerification) -> anyhow::Result<quinn::Endpo
     let mut transport = quinn::TransportConfig::default();
     // The limit applies to streams the peer opens, and only the Edge opens them.
     transport.max_concurrent_bidi_streams(MAX_INCOMING_STREAMS.into());
+    transport.receive_window(RECEIVE_WINDOW.into());
     transport.datagram_receive_buffer_size(Some(65535));
 
     let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
     client_cfg.transport_config(Arc::new(transport));
+    Ok(client_cfg)
+}
 
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_cfg);
-    Ok(endpoint)
+/// Resolves once shutdown was requested, or the sender is gone.
+async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|stop| *stop).await;
+}
+
+/// `backoff` shortened by a random part of up to half, so that Connectors that
+/// lost their Edge at the same moment do not all reconnect at the same moment.
+fn jittered(backoff: Duration) -> Duration {
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let half = backoff / 2;
+    half + half.mul_f64((random % 1024) as f64 / 1024.0)
 }
 
 /// Connect to a single Edge server, authenticate with JWT, and serve streams.
@@ -103,7 +169,8 @@ pub async fn run_connection(
     tunnel_id: String,
     verification: EdgeVerification,
     configured_server_name: Option<String>,
-    shutdown: tokio::sync::watch::Receiver<bool>,
+    drain_timeout: Duration,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let server_name = match tls_server_name(&server_addr_str, configured_server_name.as_deref()) {
         Ok(name) => name,
@@ -120,10 +187,10 @@ pub async fn run_connection(
             "the edge address is an IP literal, so its certificate needs a matching IP SAN; set [network] edge_server_name to verify against a hostname instead"
         );
     }
-    let endpoint = match build_endpoint(verification) {
-        Ok(e) => e,
+    let mut endpoints = match EdgeEndpoints::new(verification) {
+        Ok(endpoints) => endpoints,
         Err(e) => {
-            tracing::error!(error = %e, "failed to build QUIC endpoint");
+            tracing::error!(error = %e, "failed to build QUIC client configuration");
             return;
         }
     };
@@ -134,21 +201,25 @@ pub async fn run_connection(
         if *shutdown.borrow() {
             return;
         }
+        // Waiting after a replacement is not shortened: reconnecting early would
+        // take the connection back from the other Connector.
+        let mut exact_delay = None;
 
-        let result = match connect_and_authenticate(
-            &endpoint,
+        let connect = connect_and_authenticate(
+            &mut endpoints,
             &server_addr_str,
             &server_name,
             &jwt,
             services.as_deref(),
             &tunnel_id,
-        )
-        .await
-        {
+        );
+        let connected = tokio::select! {
+            connected = connect => connected,
+            () = shutdown_requested(&mut shutdown) => return,
+        };
+        let result = match connected {
             Ok(connection) => {
-                // An authenticated session proves the Edge is reachable, so a
-                // later disconnect, graceful or not, starts over from a short wait.
-                backoff = INITIAL_BACKOFF;
+                let authenticated_at = Instant::now();
                 sievetube_common::metrics::init()
                     .active_quic_connections
                     .inc();
@@ -157,18 +228,22 @@ pub async fn run_connection(
                     matcher.clone(),
                     &tunnel_id,
                     shutdown.clone(),
+                    drain_timeout,
                 )
                 .await;
                 sievetube_common::metrics::global()
                     .active_quic_connections
                     .dec();
+                if authenticated_at.elapsed() >= STABLE_SESSION {
+                    backoff = INITIAL_BACKOFF;
+                }
                 if replaced_by_another_connector(&connection) {
                     tracing::warn!(
                         server = %server_addr_str,
                         retry_secs = REPLACED_RETRY_DELAY.as_secs(),
                         "another connector with the same token took over this edge; connectors sharing a token must connect to different edges"
                     );
-                    backoff = REPLACED_RETRY_DELAY;
+                    exact_delay = Some(REPLACED_RETRY_DELAY);
                     Err(anyhow::anyhow!("connection replaced by another connector"))
                 } else {
                     result
@@ -177,6 +252,7 @@ pub async fn run_connection(
             Err(e) => Err(e),
         };
 
+        let delay = exact_delay.unwrap_or_else(|| jittered(backoff));
         match result {
             Ok(()) => {
                 tracing::info!(server = %server_addr_str, "connection closed gracefully");
@@ -185,17 +261,16 @@ pub async fn run_connection(
                 tracing::warn!(
                     server = %server_addr_str,
                     error = %e,
-                    backoff_secs = backoff.as_secs(),
+                    retry_after_ms = delay.as_millis() as u64,
                     "connection failed, retrying"
                 );
             }
         }
 
-        if *shutdown.borrow() {
-            return;
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            () = shutdown_requested(&mut shutdown) => return,
         }
-
-        tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
@@ -224,28 +299,26 @@ fn tls_server_name(server_addr_str: &str, configured: Option<&str>) -> anyhow::R
 
 /// Connect to the Edge and authenticate; returns the connection ready to serve.
 async fn connect_and_authenticate(
-    endpoint: &quinn::Endpoint,
+    endpoints: &mut EdgeEndpoints,
     server_addr_str: &str,
     server_name: &str,
     jwt: &str,
     services: Option<&Vec<ServiceAdvertisement>>,
     tunnel_id: &str,
 ) -> anyhow::Result<quinn::Connection> {
-    // Resolve address
-    let server_addr: std::net::SocketAddr = tokio::net::lookup_host(server_addr_str)
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(server_addr_str)
         .await
         .map_err(|e| anyhow::anyhow!("DNS lookup failed for {server_addr_str}: {e}"))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no addresses for {server_addr_str}"))?;
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("no addresses for {server_addr_str}");
+    }
 
     tracing::info!(server = %server_addr_str, server_name, "connecting to edge");
 
-    let connection = endpoint
-        .connect(server_addr, server_name)?
-        .await
-        .map_err(|e| anyhow::anyhow!("QUIC connect failed: {e}"))?;
+    let connection = connect_any(endpoints, &addrs, server_name).await?;
 
-    tracing::info!(server = %server_addr_str, "connected, authenticating");
+    tracing::info!(server = %server_addr_str, remote_addr = %connection.remote_address(), "connected, authenticating");
 
     // Send AuthRequest on a unidirectional stream
     let mut auth_send = connection.open_uni().await?;
@@ -277,20 +350,92 @@ async fn connect_and_authenticate(
     Ok(connection)
 }
 
+/// Connect to the first of `addrs` that answers, in the resolver's order of
+/// preference. A host name with both IPv6 and IPv4 addresses stays reachable
+/// when only one of the address families works.
+async fn connect_any(
+    endpoints: &mut EdgeEndpoints,
+    addrs: &[SocketAddr],
+    server_name: &str,
+) -> anyhow::Result<quinn::Connection> {
+    let mut failures = Vec::new();
+    for &addr in addrs {
+        let attempt = async {
+            let connecting = endpoints.for_addr(addr)?.connect(addr, server_name)?;
+            match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
+                Ok(connected) => Ok(connected?),
+                Err(_) => anyhow::bail!("timed out"),
+            }
+        };
+        match attempt.await {
+            Ok(connection) => return Ok(connection),
+            Err(e) => {
+                tracing::debug!(%addr, error = %e, "cannot connect to edge address");
+                failures.push(format!("{addr}: {e}"));
+            }
+        }
+    }
+    anyhow::bail!("QUIC connect failed: {}", failures.join("; "))
+}
+
+/// Resolves at `deadline`, or never without one.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Ask the Edge to route no new traffic to this connection.
+async fn send_going_away(connection: &quinn::Connection) -> anyhow::Result<()> {
+    let mut send = connection.open_uni().await?;
+    protocol::write_message(&mut send, &Message::GoingAway).await?;
+    send.finish()?;
+    Ok(())
+}
+
+fn close_going_away(connection: &quinn::Connection) {
+    connection.close(
+        quinn::VarInt::from_u32(sievetube_common::error::app_error::GOING_AWAY),
+        b"connector shutting down",
+    );
+}
+
 async fn serve_streams(
     connection: quinn::Connection,
     matcher: Arc<IngressMatcher>,
     tunnel_id: &str,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
+    drain_timeout: Duration,
 ) -> anyhow::Result<()> {
     let udp_forwards = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_UDP_FORWARDS));
+    // Streams and UDP forwards in flight, which a shutdown lets finish.
+    let in_flight = TaskTracker::new();
+    let mut drain_deadline = None;
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                connection.close(
-                    quinn::VarInt::from_u32(sievetube_common::error::app_error::GOING_AWAY),
-                    b"connector shutting down",
-                );
+            () = shutdown_requested(&mut shutdown), if drain_deadline.is_none() => {
+                // Edges that know the notice stop routing new traffic here, so
+                // the streams in flight can finish before the connection closes.
+                // Older Edges keep routing until the connection closes.
+                match tokio::time::timeout(GOING_AWAY_TIMEOUT, send_going_away(&connection)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::debug!(tunnel_id, error = %e, "cannot send going-away notice"),
+                    Err(_) => tracing::debug!(tunnel_id, "sending the going-away notice timed out"),
+                }
+                in_flight.close();
+                drain_deadline = Some(Instant::now() + drain_timeout);
+                tracing::info!(tunnel_id, in_flight = in_flight.len(), "draining connection");
+            }
+
+            () = in_flight.wait(), if drain_deadline.is_some() => {
+                close_going_away(&connection);
+                return Ok(());
+            }
+
+            () = sleep_until(drain_deadline) => {
+                tracing::warn!(tunnel_id, remaining = in_flight.len(), "drain timeout reached; closing the connection");
+                close_going_away(&connection);
                 return Ok(());
             }
 
@@ -305,7 +450,7 @@ async fn serve_streams(
                 // broken stream affects neither the other streams nor the connection.
                 let matcher = matcher.clone();
                 let tid = tunnel_id.to_string();
-                tokio::spawn(async move {
+                in_flight.spawn(async move {
                     serve_stream(send, recv, matcher, tid).await;
                 });
             }
@@ -338,7 +483,7 @@ async fn serve_streams(
                 };
                 let payload = payload.to_vec();
                 let conn = connection.clone();
-                tokio::spawn(async move {
+                in_flight.spawn(async move {
                     let _permit = permit;
                     match crate::forwarder::forward_udp_datagram(&payload, target_addr).await {
                         Ok(Some(reply)) => {
@@ -568,8 +713,8 @@ mod tests {
         assert!(tls_server_name("2001:db8::1:4433", None).is_err());
     }
 
-    /// Connect to a loopback server that closes the connection with `code`.
-    async fn closed_by_server_with(code: u32) -> quinn::Connection {
+    /// A loopback Edge endpoint with a self-signed certificate for `edge.test`.
+    fn test_server(bind: &str) -> Option<quinn::Endpoint> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let cert = rcgen::generate_simple_self_signed(vec!["edge.test".to_string()]).unwrap();
         let key =
@@ -582,15 +727,22 @@ mod tests {
         let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
         ));
-        let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let server_addr = server.local_addr().unwrap();
+        quinn::Endpoint::server(server_cfg, bind.parse().unwrap()).ok()
+    }
 
-        let client = build_endpoint(EdgeVerification::Skip).unwrap();
-        let (_, connection) = tokio::join!(
-            async {
-                let conn = server.accept().await.unwrap().await.unwrap();
-                conn.close(quinn::VarInt::from_u32(code), b"test");
-            },
+    /// A Connector-side connection and the Edge side of it.
+    async fn connected_pair() -> (
+        quinn::Connection,
+        quinn::Connection,
+        EdgeEndpoints,
+        quinn::Endpoint,
+    ) {
+        let server = test_server("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut endpoints = EdgeEndpoints::new(EdgeVerification::Skip).unwrap();
+        let client = endpoints.for_addr(server_addr).unwrap().clone();
+        let (edge, connector) = tokio::join!(
+            async { server.accept().await.unwrap().await.unwrap() },
             async {
                 client
                     .connect(server_addr, "edge.test")
@@ -599,8 +751,152 @@ mod tests {
                     .unwrap()
             }
         );
+        (connector, edge, endpoints, server)
+    }
+
+    /// Connect to a loopback server that closes the connection with `code`.
+    async fn closed_by_server_with(code: u32) -> quinn::Connection {
+        let (connection, edge, _endpoints, _server) = connected_pair().await;
+        edge.close(quinn::VarInt::from_u32(code), b"test");
         connection.closed().await;
         connection
+    }
+
+    #[tokio::test]
+    async fn edges_are_reached_over_ipv6_and_past_unusable_addresses() {
+        let Some(server) = test_server("[::1]:0") else {
+            eprintln!("skipping: no IPv6 loopback");
+            return;
+        };
+        let server_addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            connection.closed().await
+        });
+        let mut endpoints = EdgeEndpoints::new(EdgeVerification::Skip).unwrap();
+        // The first address cannot be connected to at all.
+        let unusable: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let connection = connect_any(&mut endpoints, &[unusable, server_addr], "edge.test")
+            .await
+            .unwrap();
+        assert_eq!(connection.remote_address(), server_addr);
+        assert!(endpoints.v4.is_some() && endpoints.v6.is_some());
+    }
+
+    /// Serve `connector` with one ingress rule for web.test to `target`.
+    fn serve(
+        connector: quinn::Connection,
+        target: SocketAddr,
+        drain_timeout: Duration,
+    ) -> (
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let matcher = Arc::new(IngressMatcher::new(vec![
+            sievetube_common::config::IngressRule {
+                hostname: Some("web.test".to_string()),
+                protocol: None,
+                target: target.to_string(),
+            },
+        ]));
+        let (stop, shutdown) = watch::channel(false);
+        let serving = tokio::spawn(async move {
+            serve_streams(connector, matcher, "tenant", shutdown, drain_timeout).await
+        });
+        (stop, serving)
+    }
+
+    /// Open a tunnel stream from the Edge side as the Edge does for a request.
+    async fn open_tunnel(edge: &quinn::Connection) -> (quinn::SendStream, quinn::RecvStream) {
+        let (mut send, recv) = edge.open_bi().await.unwrap();
+        protocol::write_message(
+            &mut send,
+            &Message::ConnectRequest(protocol::ConnectRequest {
+                request_id: 1,
+                hostname: "web.test".to_string(),
+                protocol: Protocol::Tcp,
+                client_addr: "203.0.113.9:1234".parse().unwrap(),
+            }),
+        )
+        .await
+        .unwrap();
+        (send, recv)
+    }
+
+    #[tokio::test]
+    async fn shutdown_announces_going_away_and_waits_for_streams_in_flight() {
+        use tokio::io::AsyncWriteExt;
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (connector, edge, _endpoints, _server) = connected_pair().await;
+        let (stop, serving) = serve(
+            connector,
+            backend.local_addr().unwrap(),
+            Duration::from_secs(30),
+        );
+        let (mut send, _recv) = open_tunnel(&edge).await;
+        let (mut target, _) = backend.accept().await.unwrap();
+
+        stop.send(true).unwrap();
+        let mut notice = tokio::time::timeout(Duration::from_secs(5), edge.accept_uni())
+            .await
+            .expect("the edge is told before anything closes")
+            .unwrap();
+        assert!(matches!(
+            protocol::read_message(&mut notice).await.unwrap(),
+            Message::GoingAway
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !serving.is_finished(),
+            "the stream in flight is still served"
+        );
+        assert!(edge.close_reason().is_none());
+
+        // The request completes on both sides.
+        send.finish().unwrap();
+        target.shutdown().await.unwrap();
+        drop(target);
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the connection closes once its streams are done")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            edge.closed().await,
+            quinn::ConnectionError::ApplicationClosed(close)
+                if close.error_code == quinn::VarInt::from_u32(sievetube_common::error::app_error::GOING_AWAY)
+        ));
+    }
+
+    #[tokio::test]
+    async fn draining_ends_at_the_drain_timeout() {
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (connector, edge, _endpoints, _server) = connected_pair().await;
+        let (stop, serving) = serve(
+            connector,
+            backend.local_addr().unwrap(),
+            Duration::from_millis(300),
+        );
+        let (_send, _recv) = open_tunnel(&edge).await;
+        let (_target, _) = backend.accept().await.unwrap();
+
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), serving)
+            .await
+            .expect("a stream that never ends does not hold up shutdown")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn jitter_stays_within_half_of_the_backoff() {
+        let backoff = Duration::from_secs(8);
+        for _ in 0..100 {
+            let delay = jittered(backoff);
+            assert!(delay >= backoff / 2 && delay <= backoff, "{delay:?}");
+        }
     }
 
     #[tokio::test]
