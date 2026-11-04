@@ -30,7 +30,7 @@ toml = "0.8"
 jsonwebtoken = "9"
 
 # Valkey/Redis
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+redis = { version = "1.7", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 
 # HTTP
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
