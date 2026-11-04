@@ -24,7 +24,7 @@ x509-parser = "0.18"
 # Serialization & config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 
 # Auth
 jsonwebtoken = "9"
