@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustls::pki_types::pem::PemObject;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -57,12 +58,13 @@ pub fn build_endpoint(
             let key_pem = std::fs::read(key_path)
                 .map_err(|e| anyhow::anyhow!("cannot read {key_path}: {e}"))?;
             let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-                rustls_pemfile::certs(&mut cert_pem.as_slice()).collect::<Result<_, _>>()?;
+                rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem)
+                    .collect::<Result<_, _>>()?;
             if certs.is_empty() {
                 anyhow::bail!("no certificate found in {cert_path}");
             }
-            let key = rustls_pemfile::private_key(&mut key_pem.as_slice())?
-                .ok_or_else(|| anyhow::anyhow!("no private key found in {key_path}"))?;
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem)
+                .map_err(|e| anyhow::anyhow!("cannot parse private key in {key_path}: {e}"))?;
             (certs, key)
         }
         _ => {

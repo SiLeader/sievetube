@@ -35,7 +35,8 @@ use sievetube_common::observability;
 const VALKEY_LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
 
 fn issue_token_command(args: &[String]) -> anyhow::Result<()> {
-    use sievetube_common::auth::{sign_jwt, TunnelClaims};
+    use sievetube_common::auth::{sign_jwt, validate_jwt_secret, TunnelClaims};
+    use std::io::Read;
 
     let mut secret: Option<String> = None;
     let mut secret_file: Option<PathBuf> = None;
@@ -85,7 +86,7 @@ fn issue_token_command(args: &[String]) -> anyhow::Result<()> {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("--exp-hours must be a positive integer"))?;
             }
-            other => anyhow::bail!("unknown flag: {other}\nUsage: sievetube-edge issue-token (--secret-file <path> | --secret <secret>) --sub <tenant_id> --hostname <hostname> [--exp-hours <hours>]"),
+            other => anyhow::bail!("unknown flag: {other}\nUsage: sievetube-edge issue-token (--secret-file <path|-> | --secret <secret>) --sub <tenant_id> --hostname <hostname> [--exp-hours <hours>]"),
         }
         i += 1;
     }
@@ -95,6 +96,13 @@ fn issue_token_command(args: &[String]) -> anyhow::Result<()> {
     }
     let secret = match (secret, secret_file) {
         (Some(secret), None) => secret,
+        (None, Some(path)) if path.as_os_str() == "-" => {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_to_string(&mut value)
+                .map_err(|e| anyhow::anyhow!("cannot read JWT secret from stdin: {e}"))?;
+            value.trim_end_matches(['\r', '\n']).to_string()
+        }
         (None, Some(path)) => std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("cannot read secret file {}: {e}", path.display()))?
             .trim_end_matches(['\r', '\n'])
@@ -104,9 +112,7 @@ fn issue_token_command(args: &[String]) -> anyhow::Result<()> {
         })?,
         (Some(_), Some(_)) => unreachable!(),
     };
-    if secret.is_empty() {
-        anyhow::bail!("JWT secret must not be empty");
-    }
+    validate_jwt_secret(secret.as_bytes()).map_err(anyhow::Error::msg)?;
     let sub = sub.ok_or_else(|| anyhow::anyhow!("--sub is required"))?;
     // Mesh messages carry the tenant id and are limited to this length.
     if sub.is_empty() || sub.len() > sievetube_common::mesh_protocol::MAX_ID_LEN {

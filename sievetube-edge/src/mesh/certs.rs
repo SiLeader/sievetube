@@ -10,6 +10,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
 };
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::RootCertStore;
 use x509_parser::extensions::GeneralName;
@@ -132,13 +133,13 @@ impl MeshIdentity {
         let key_pem = read(key_path)?;
 
         let mut roots = RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut &ca_pem[..]) {
+        for cert in CertificateDer::pem_slice_iter(&ca_pem) {
             roots.add(cert.context("invalid mesh CA certificate")?)?;
         }
         if roots.is_empty() {
             bail!("no CA certificate in {}", ca_path.display());
         }
-        let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &cert_pem[..])
+        let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
             .collect::<Result<_, _>>()
             .context("invalid mesh certificate")?;
         let leaf = cert_chain.first().context("no mesh certificate found")?;
@@ -146,9 +147,7 @@ impl MeshIdentity {
         if ids != [edge_id] {
             bail!("mesh certificate identifies {ids:?}, expected exactly {edge_id:?}");
         }
-        let key = rustls_pemfile::private_key(&mut &key_pem[..])
-            .context("invalid mesh private key")?
-            .context("no mesh private key found")?;
+        let key = PrivateKeyDer::from_pem_slice(&key_pem).context("invalid mesh private key")?;
         rustls::sign::CertifiedKey::from_der(
             cert_chain.clone(),
             key.clone_key(),

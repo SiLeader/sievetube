@@ -160,12 +160,9 @@ async fn forwarded_for_is_trusted_only_from_configured_proxies_and_reload_is_val
     assert_eq!(status(&response), 403, "{response}");
 }
 
-/// The config file path of an edge started by `start_http_tunnel` (found via /proc).
+/// The config file path of an edge started by `start_http_tunnel`.
 fn edge_config_path(env: &helpers::HttpTunnel) -> std::path::PathBuf {
-    let pid = env.edge_process.pid().expect("edge pid");
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).expect("read cmdline");
-    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
-    std::path::PathBuf::from(String::from_utf8_lossy(args[1]).into_owned())
+    env.edge_process.config_path().to_path_buf()
 }
 
 /// A minimal ABI v1 plugin returning a constant or trapping.

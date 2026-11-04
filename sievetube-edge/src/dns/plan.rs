@@ -94,6 +94,10 @@ pub fn compile(cfg: &DnsConfig) -> anyhow::Result<CompiledDns> {
                         "dns.providers[{name}]: set exactly one of api_token_env or api_token_file"
                     );
                 }
+                if let Some(base_url) = provider.api_base_url.as_deref() {
+                    super::cloudflare::validate_api_base_url(base_url)
+                        .map_err(|e| anyhow!("dns.providers[{name}]: {e}"))?;
+                }
                 if provider.hosted_zone_id.is_some()
                     || provider.endpoint_url.is_some()
                     || provider.region.is_some()
@@ -856,5 +860,9 @@ mod tests {
         let mut no_allowed = config(vec![]);
         no_allowed.allowed_zones.clear();
         assert!(compile(&no_allowed).is_err());
+
+        let mut plaintext_cloudflare = config(vec![]);
+        plaintext_cloudflare.providers[0].api_base_url = Some("http://api.cloudflare.com".into());
+        assert!(compile(&plaintext_cloudflare).is_err());
     }
 }

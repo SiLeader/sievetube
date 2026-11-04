@@ -881,16 +881,11 @@ impl EdgeConfig {
         {
             bail!("server UDP limits and max_connector_connections must be greater than 0");
         }
-        if self.auth.jwt_secret.is_empty() {
-            bail!("auth.jwt_secret must not be empty");
-        }
-        if self
-            .auth
-            .jwt_previous_secrets
-            .iter()
-            .any(|secret| secret.is_empty())
-        {
-            bail!("auth.jwt_previous_secrets must not contain an empty secret");
+        sievetube_common::auth::validate_jwt_secret(self.auth.jwt_secret.as_bytes())
+            .map_err(|e| anyhow!("auth.jwt_secret: {e}"))?;
+        for (index, secret) in self.auth.jwt_previous_secrets.iter().enumerate() {
+            sievetube_common::auth::validate_jwt_secret(secret.as_bytes())
+                .map_err(|e| anyhow!("auth.jwt_previous_secrets[{index}]: {e}"))?;
         }
         let mut jwt_secrets = HashSet::new();
         if !jwt_secrets.insert(self.auth.jwt_secret.as_str())
@@ -1008,7 +1003,7 @@ http_listen = "127.0.0.1:8080"
 https_listen = "127.0.0.1:8443"
 
 [auth]
-jwt_secret = "secret"
+jwt_secret = "minimal-test-secret-0123456789abcdef"
 
 [tls]
 cert_dir = "/nonexistent"
@@ -1016,7 +1011,11 @@ cert_dir = "/nonexistent"
 
     #[test]
     fn example_config_is_valid() {
-        let cfg = EdgeConfig::from_toml(include_str!("../../config/edge.example.toml")).unwrap();
+        let example = include_str!("../../config/edge.example.toml").replace(
+            "replace-with-at-least-32-random-bytes",
+            "example-test-secret-0123456789abcdef",
+        );
+        let cfg = EdgeConfig::from_toml(&example).unwrap();
         assert_eq!(cfg.server.quic_listen, "0.0.0.0:4433");
         // The shipped example is a single-Edge deployment.
         assert_eq!(cfg.config_version, Some(2));

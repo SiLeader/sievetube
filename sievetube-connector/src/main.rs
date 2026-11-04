@@ -94,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         quic_client::EdgeVerification::from_config(
             cfg.network.edge_ca_cert.as_deref(),
             &cfg.network.edge_cert_sha256,
+            cfg.network.insecure_skip_verify,
         )
     };
 

@@ -78,7 +78,7 @@ cp config/edge.example.toml edge.toml
 
 最低限、`edge.toml`の次の項目を編集します。
 
-- `auth.jwt_secret`を十分に長いランダムな秘密値へ変更します。
+- `auth.jwt_secret`を32ランダムバイト以上の秘密値へ変更します（例: `openssl rand -hex 32`）。
 - `server.quic_listen`、`server.http_listen`、`server.https_listen`で指定したポートへ到達できることを確認します。
 - 単一Edge構成では`routing.mode = "direct"`のままにします。
 - `tls.cert_dir`を公開HTTPS証明書の配置先にします。公開証明書を用意する前でもHTTPの疎通確認は可能です。
@@ -93,15 +93,17 @@ RUST_LOG=info ./target/release/sievetube-edge edge.toml
 
 ### 3. Connector用トークンを発行する
 
-`auth.jwt_secret`に設定したものと同じ秘密値を使用します。
+`auth.jwt_secret`に設定したものと同じ秘密値を、権限を制限したファイルから読み込みます。
 
 ```sh
 ./target/release/sievetube-edge issue-token \
-  --secret 'replace-with-your-secret' \
+  --secret-file /run/secrets/sievetube-jwt \
   --sub tenant-1 \
   --hostname app.example.com \
   --exp-hours 8760
 ```
+
+`--secret-file -`を指定すると標準入力から読み込めます。`--secret`も互換性のため利用できますが、プロセス一覧やシェル履歴へ値が残るため避けてください。
 
 署名済みJWTが標準出力に表示されます。このトークンを持つ利用者は、有効期限まで許可されたホスト名を登録できるため、秘密情報として扱ってください。
 
@@ -122,8 +124,8 @@ token = "<generated-jwt>"
 [network]
 public_servers = ["edge.example.net:4433"]
 
-# 本番環境ではいずれかを設定します。詳細は「セキュリティ」を参照してください。
-# edge_ca_cert = "/etc/sievetube/edge-ca.pem"
+# いずれか1つの検証方式が必須です。詳細は「セキュリティ」を参照してください。
+edge_ca_cert = "/etc/sievetube/edge-ca.pem"
 # edge_cert_sha256 = ["<sha256-certificate-fingerprint>"]
 
 [[ingress]]
@@ -193,7 +195,7 @@ target = "127.0.0.1:19132"
 ## セキュリティ
 
 - デプロイ前にサンプルの秘密値をすべて変更し、ConnectorのJWTと秘密鍵へのアクセスを制限してください。
-- すべてのConnectorで`network.edge_ca_cert`または`network.edge_cert_sha256`を設定してください。どちらもない場合、EdgeのQUIC証明書は**検証されません**。この状態は初期移行またはテスト用途に限ってください。
+- すべてのConnectorで`network.edge_ca_cert`または`network.edge_cert_sha256`を設定してください。どちらもない場合は起動に失敗します。移行・テスト時だけ、明示的な危険設定`network.insecure_skip_verify = true`を利用できます。
 - 公開HTTPSには、`tls.cert_dir`へ`<hostname>.crt`と`<hostname>.key`を配置するか、明示的なドメイン許可リストを設定してACMEを有効化します。
 - ヘルスチェック・メトリクス用リスナーは、別途保護しない限り非公開インターフェースだけで待ち受けてください。
 - トラフィックポリシーは`monitor`モードから開始し、判定を確認してから`enforce`へ切り替えてください。

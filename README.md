@@ -78,7 +78,7 @@ cp config/edge.example.toml edge.toml
 
 At minimum, edit `edge.toml` as follows:
 
-- Replace `auth.jwt_secret` with a long, random secret.
+- Replace `auth.jwt_secret` with at least 32 random bytes (for example, `openssl rand -hex 32`).
 - Confirm `server.quic_listen`, `server.http_listen`, and `server.https_listen` are reachable on the intended ports.
 - Keep `routing.mode = "direct"` for a single-Edge deployment.
 - Set `tls.cert_dir` to the directory containing public HTTPS certificates. HTTP can be tested before a public certificate is installed.
@@ -104,6 +104,9 @@ the process argument list:
   --hostname app.example.com \
   --exp-hours 8760
 ```
+
+Use `--secret-file -` to read the secret from standard input. The legacy
+`--secret` flag is supported but exposes the value through arguments and shell history.
 
 The command prints a signed JWT. Treat it as a secret: anyone holding it can register the allowed hostnames until the token expires.
 
@@ -135,8 +138,8 @@ token = "<generated-jwt>"
 [network]
 public_servers = ["edge.example.net:4433"]
 
-# Configure one of these in production; see Security below.
-# edge_ca_cert = "/etc/sievetube/edge-ca.pem"
+# Exactly one verification mode is required; see Security below.
+edge_ca_cert = "/etc/sievetube/edge-ca.pem"
 # edge_cert_sha256 = ["<sha256-certificate-fingerprint>"]
 
 [[ingress]]
@@ -206,7 +209,7 @@ target = "127.0.0.1:19132"
 ## Security
 
 - Replace every example secret before deployment and restrict access to Connector JWTs and private keys.
-- Configure `network.edge_ca_cert` or `network.edge_cert_sha256` on every Connector. If neither is set, the Edge's QUIC certificate is **not verified**; this is intended only for initial migration or testing.
+- Configure `network.edge_ca_cert` or `network.edge_cert_sha256` on every Connector. Startup fails without one unless the explicit, unsafe `network.insecure_skip_verify = true` migration/testing option is set.
 - For public HTTPS, place `<hostname>.crt` and `<hostname>.key` in `tls.cert_dir`, or enable ACME for an explicit domain allowlist.
 - Keep the health/metrics listener on a private interface unless it is protected separately.
 - Start traffic policies in `monitor` mode, inspect their decisions, and then switch to `enforce`.

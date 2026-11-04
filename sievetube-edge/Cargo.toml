@@ -14,7 +14,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 rcgen = { workspace = true }
 ring = { workspace = true }
 x509-parser = { workspace = true }

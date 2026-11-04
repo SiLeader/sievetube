@@ -8,7 +8,7 @@ use std::fmt;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{header, Method, Request, StatusCode};
+use http::{header, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -27,8 +27,38 @@ const CONFLICT_CODES: [i64; 3] = [81053, 81057, 81058];
 
 pub type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
 
+/// Reject endpoints that could disclose the bearer token over a remote
+/// plaintext connection. Loopback HTTP remains available for contract tests.
+pub(crate) fn validate_api_base_url(base_url: &str) -> Result<(), String> {
+    let uri: Uri = base_url
+        .parse()
+        .map_err(|e| format!("invalid Cloudflare api_base_url: {e}"))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| "Cloudflare api_base_url must include a scheme".to_string())?;
+    let host = uri
+        .host()
+        .ok_or_else(|| "Cloudflare api_base_url must include a host".to_string())?;
+    let ip_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if scheme == "https"
+        || (scheme == "http"
+            && ip_host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback()))
+    {
+        return Ok(());
+    }
+    Err(
+        "Cloudflare api_base_url must use https (http is allowed only for a loopback IP address)"
+            .to_string(),
+    )
+}
+
 /// HTTPS client verifying servers with the platform trust store. Plain HTTP is
-/// allowed only because the base URL can point at a local test server.
+/// enabled in the transport only for validated loopback test endpoints.
 pub fn https_client() -> Result<HttpsClient, DnsError> {
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .try_with_platform_verifier()
@@ -124,12 +154,11 @@ impl CloudflareProvider {
         token: Secret,
         timeout: Duration,
     ) -> Result<Self, DnsError> {
+        let base_url = base_url.unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string());
+        validate_api_base_url(&base_url).map_err(DnsError::Provider)?;
         Ok(CloudflareProvider {
             zone_id,
-            base_url: base_url
-                .unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string())
-                .trim_end_matches('/')
-                .to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
             token,
             client: https_client()?,
             timeout,
@@ -353,5 +382,20 @@ impl CloudflareProvider {
                 .await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_api_base_url;
+
+    #[test]
+    fn api_base_url_protects_the_bearer_token() {
+        assert!(validate_api_base_url("https://api.cloudflare.com/client/v4").is_ok());
+        assert!(validate_api_base_url("http://127.0.0.1:8080/client/v4").is_ok());
+        assert!(validate_api_base_url("http://[::1]:8080/client/v4").is_ok());
+        assert!(validate_api_base_url("http://api.cloudflare.com/client/v4").is_err());
+        assert!(validate_api_base_url("http://192.0.2.1/client/v4").is_err());
+        assert!(validate_api_base_url("api.cloudflare.com/client/v4").is_err());
     }
 }

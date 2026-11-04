@@ -53,7 +53,7 @@ https_listen = "0.0.0.0:443"
 health_listen = "127.0.0.1:9090"
 
 [auth]
-jwt_secret = "十分に長いランダムな値へ必ず変更する"
+jwt_secret = "32ランダムバイト以上の値へ必ず変更する"
 
 [tls]
 cert_dir = "/etc/sievetube/certs"
@@ -84,7 +84,7 @@ Edge の `auth.jwt_secret` と同じ秘密値を改行なしのファイルへ�
   --exp-hours 8760
 ```
 
-複数のホスト名を許可するときは `--hostname` を繰り返します。`--secret-file` の代わりに `SIEVETUBE_JWT_SECRET` も利用できます。コマンドラインの `--secret` はプロセス一覧やシェル履歴へ残る可能性があるため、本番では避けてください。
+複数のホスト名を許可するときは `--hostname` を繰り返します。`--secret-file -`で標準入力から読み込め、`SIEVETUBE_JWT_SECRET`も利用できます。コマンドラインの`--secret`はプロセス一覧やシェル履歴へ残る可能性があるため、本番では避けてください。
 
 JWT の `sub` はテナント識別子です。同じ Edge に同じ `sub` の Connector が接続すると、新しい接続が古い接続を置き換えます。出力された JWT は、その許可ホスト名を有効期限まで登録できる秘密情報として扱います。
 
@@ -117,7 +117,7 @@ target = "http_status:404"
 Ingress は上から評価され、最初に一致したルールが使われます。Catch-all は最後に置いてください。
 
 > [!WARNING]
-> `edge_ca_cert` と `edge_cert_sha256` のどちらも設定しない場合、Connector は Edge の QUIC 証明書を検証しません。これは初回のローカル検証に限り、本番では Edge に `server.quic_cert` / `server.quic_key` を設定したうえで、Connector に CA バンドルまたは証明書ピンを設定してください。
+> `edge_ca_cert`または`edge_cert_sha256`が必須です。初回のローカル検証や短期間の移行でだけ、代わりに`insecure_skip_verify = true`を明示できます。本番では Edge に`server.quic_cert` / `server.quic_key`を設定したうえで、Connector に CA バンドルまたは証明書ピンを設定してください。
 
 CA で検証する構成例です。
 

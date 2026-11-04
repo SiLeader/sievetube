@@ -79,8 +79,8 @@ hostname = "game.example.com"
 
 ```toml
 [auth]
-jwt_secret = "new-secret"
-jwt_previous_secrets = ["old-secret"]
+jwt_secret = "new-random-secret-of-at-least-32-bytes"
+jwt_previous_secrets = ["old-random-secret-of-at-least-32-bytes"]
 ```
 
 Edge は新旧どちらで署名されたトークンも検証し、新規トークンは `jwt_secret` だけで発行します。
@@ -114,11 +114,11 @@ max_concurrent_streams = 256
 target_connect_timeout_secs = 10
 ```
 
-`edge_ca_cert` と `edge_cert_sha256` は同時に指定できません。
+`edge_ca_cert`、`edge_cert_sha256`、`insecure_skip_verify = true`のいずれか1つだけを指定します。
 
 - CA 検証: 証明書を通常どおり更新できるため、継続運用に向きます。接続先のホスト名は証明書の SAN と一致させます。
 - SHA-256 ピン: 自己署名証明書などを特定の証明書に固定します。更新前に新旧のピンを並べることで段階移行できます。
-- どちらもなし: 暗号化はされますが接続相手を認証しません。テストまたは移行用途だけにします。
+- 明示的な無検証: テストまたは短期間の移行時だけ`insecure_skip_verify = true`を指定できます。CA、ピン、明示的な無検証のいずれもない場合は起動に失敗します。
 
 `max_concurrent_streams` は全 Edge 接続で共有されます。Connector のファイルディスクリプター数とローカルサービスの同時接続上限より小さく設計してください。
 

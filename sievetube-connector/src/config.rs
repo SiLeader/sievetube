@@ -33,6 +33,10 @@ pub struct NetworkConfig {
     /// Hex SHA-256 fingerprints of accepted Edge certificates (pinning)
     #[serde(default)]
     pub edge_cert_sha256: Vec<String>,
+    /// Disable all Edge certificate verification. This must be explicitly set
+    /// and is intended only for short-lived migrations and local testing.
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
     /// How long a shutdown waits for the streams in flight before closing
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_secs: u64,
@@ -113,8 +117,13 @@ impl ConnectorConfig {
                 .map_err(|e| anyhow::anyhow!("[[ingress]] rule {}: {e}", index + 1))?;
         }
         let pins = &self.network.edge_cert_sha256;
-        if self.network.edge_ca_cert.is_some() && !pins.is_empty() {
-            anyhow::bail!("[network] set either edge_ca_cert or edge_cert_sha256, not both");
+        let verification_modes = usize::from(self.network.edge_ca_cert.is_some())
+            + usize::from(!pins.is_empty())
+            + usize::from(self.network.insecure_skip_verify);
+        if verification_modes != 1 {
+            anyhow::bail!(
+                "[network] set exactly one of edge_ca_cert, edge_cert_sha256, or insecure_skip_verify = true"
+            );
         }
         for pin in pins {
             let pin = pin.trim();
@@ -135,9 +144,9 @@ impl ConnectorConfig {
                 anyhow::bail!("[network] edge_server_name: {name} is not a valid server name");
             }
         }
-        if self.network.edge_ca_cert.is_none() && pins.is_empty() {
+        if self.network.insecure_skip_verify {
             tracing::warn!(
-                "no [network] edge_ca_cert or edge_cert_sha256 configured; the Edge's QUIC certificate is not verified"
+                "[network] insecure_skip_verify is enabled; the Edge's QUIC certificate is not verified"
             );
         }
         // Validate that the last rule is a catch-all if any non-catch-all rules exist
@@ -238,6 +247,7 @@ token = "a.b.c"
 
 [network]
 public_servers = ["edge.test:4433"]
+insecure_skip_verify = true
 
 [[ingress]]
 target = "127.0.0.1:8080"
@@ -246,6 +256,32 @@ target = "127.0.0.1:8080"
         assert_eq!(config.network.drain_timeout_secs, 10);
         assert_eq!(config.network.max_concurrent_streams, 256);
         assert_eq!(config.network.target_connect_timeout_secs, 10);
+    }
+
+    #[test]
+    fn edge_verification_requires_exactly_one_mode() {
+        let base = r#"
+[auth]
+token = "a.b.c"
+
+[network]
+public_servers = ["edge.test:4433"]
+
+[[ingress]]
+target = "127.0.0.1:8080"
+"#;
+        let config: ConnectorConfig = toml::from_str(base).unwrap();
+        assert!(config.validate().is_err());
+
+        let conflicting = base.replace(
+            "public_servers = [\"edge.test:4433\"]",
+            &format!(
+                "public_servers = [\"edge.test:4433\"]\nedge_cert_sha256 = [\"{}\"]\ninsecure_skip_verify = true",
+                "ab".repeat(32)
+            ),
+        );
+        let config: ConnectorConfig = toml::from_str(&conflicting).unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -258,6 +294,7 @@ token = "a.b.c"
 
 [network]
 public_servers = ["edge.test:4433"]
+insecure_skip_verify = true
 max_concurrent_streams = {limit}
 
 [[ingress]]
@@ -281,6 +318,7 @@ token = "a.b.c"
 
 [network]
 public_servers = ["edge.test:4433"]
+insecure_skip_verify = true
 connect_timout_secs = 10
 
 [[ingress]]

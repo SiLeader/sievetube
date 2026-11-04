@@ -3,6 +3,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::SieveTubeError;
 
+/// HS256 requires a key at least as long as its 256-bit hash output.
+pub const MIN_JWT_SECRET_LEN: usize = 32;
+
+/// Enforce a minimum key size and reject well-known documentation values.
+pub fn validate_jwt_secret(secret: &[u8]) -> Result<(), SieveTubeError> {
+    if secret.len() < MIN_JWT_SECRET_LEN {
+        return Err(SieveTubeError::Auth(format!(
+            "JWT secret must be at least {MIN_JWT_SECRET_LEN} bytes"
+        )));
+    }
+    const PLACEHOLDERS: [&[u8]; 3] = [
+        b"change-me-to-a-long-random-secret",
+        b"replace-with-at-least-32-random-bytes",
+        b"this-is-not-a-secure-production-secret",
+    ];
+    if PLACEHOLDERS.contains(&secret) || secret.iter().all(|byte| *byte == secret[0]) {
+        return Err(SieveTubeError::Auth(
+            "JWT secret is a known placeholder; generate a random secret".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Claims embedded in the JWT used by Connectors to authenticate with Edges.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelClaims {
@@ -17,6 +40,7 @@ pub struct TunnelClaims {
 }
 
 pub fn sign_jwt(claims: &TunnelClaims, secret: &[u8]) -> Result<String, SieveTubeError> {
+    validate_jwt_secret(secret)?;
     jsonwebtoken::encode(
         &Header::default(),
         claims,
@@ -26,6 +50,7 @@ pub fn sign_jwt(claims: &TunnelClaims, secret: &[u8]) -> Result<String, SieveTub
 }
 
 pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<TokenData<TunnelClaims>, SieveTubeError> {
+    validate_jwt_secret(secret)?;
     let mut validation = Validation::default();
     validation.validate_exp = true;
     validation.leeway = 0;
@@ -71,7 +96,7 @@ mod tests {
 
     #[test]
     fn valid_jwt_roundtrip() {
-        let secret = b"supersecret";
+        let secret = b"supersecret-supersecret-0123456789";
         let claims = make_claims(3600);
         let token = sign_jwt(&claims, secret).unwrap();
         let decoded = verify_jwt(&token, secret).unwrap();
@@ -81,21 +106,33 @@ mod tests {
 
     #[test]
     fn wrong_secret_rejected() {
-        let token = sign_jwt(&make_claims(3600), b"secret-a").unwrap();
-        assert!(verify_jwt(&token, b"secret-b").is_err());
+        let token = sign_jwt(&make_claims(3600), b"secret-a-secret-a-secret-a-123456").unwrap();
+        assert!(verify_jwt(&token, b"secret-b-secret-b-secret-b-123456").is_err());
     }
 
     #[test]
     fn expired_token_rejected() {
         let claims = make_claims(-3600);
-        let token = sign_jwt(&claims, b"secret").unwrap();
-        assert!(verify_jwt(&token, b"secret").is_err());
+        let secret = b"secret-secret-secret-secret-12345678";
+        let token = sign_jwt(&claims, secret).unwrap();
+        assert!(verify_jwt(&token, secret).is_err());
     }
 
     #[test]
     fn retained_secret_allows_rolling_rotation() {
-        let token = sign_jwt(&make_claims(3600), b"old-secret").unwrap();
-        let secrets = vec![b"new-secret".to_vec(), b"old-secret".to_vec()];
+        let old_secret = b"old-secret-old-secret-old-secret-12";
+        let token = sign_jwt(&make_claims(3600), old_secret).unwrap();
+        let secrets = vec![
+            b"new-secret-new-secret-new-secret-12".to_vec(),
+            old_secret.to_vec(),
+        ];
         assert!(verify_jwt_any(&token, &secrets).is_ok());
+    }
+
+    #[test]
+    fn weak_and_placeholder_secrets_are_rejected() {
+        assert!(validate_jwt_secret(b"short").is_err());
+        assert!(validate_jwt_secret(b"change-me-to-a-long-random-secret").is_err());
+        assert!(validate_jwt_secret(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_err());
     }
 }

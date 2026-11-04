@@ -39,7 +39,8 @@ max_connector_connections = 4096
 [auth]
 # HMAC-SHA256 secret used to verify Connector JWTs.
 # Must match the secret used to sign the Connector's token.
-jwt_secret = "change-me-to-a-long-random-secret"
+# Generate one with `openssl rand -hex 32`; this placeholder is rejected.
+jwt_secret = "replace-with-at-least-32-random-bytes"
 # During rotation, put the former secret here until every old token has expired.
 # New tokens are always signed with jwt_secret.
 # jwt_previous_secrets = ["former-secret"]

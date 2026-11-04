@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;
 use x509_parser::extensions::GeneralName;
@@ -100,13 +101,12 @@ pub fn parse_and_validate(
     source: CertSource,
     now: i64,
 ) -> anyhow::Result<CertEntry> {
-    let chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &cert_pem[..])
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<_, _>>()
         .context("failed to parse certificate PEM")?;
     let leaf = chain.first().cloned().context("no certificate found")?;
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &key_pem[..])
-        .context("failed to parse private key PEM")?
-        .context("no private key found")?;
+    let key: PrivateKeyDer<'static> =
+        PrivateKeyDer::from_pem_slice(key_pem).context("failed to parse private key PEM")?;
 
     let provider = rustls::crypto::ring::default_provider();
     let certified_key = CertifiedKey::from_der(chain, key, &provider)

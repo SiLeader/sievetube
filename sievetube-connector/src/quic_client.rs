@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::rustls;
+use rustls::pki_types::pem::PemObject;
 use sievetube_common::config::{Protocol, Target};
 use sievetube_common::hostname;
 use sievetube_common::protocol::{
@@ -57,12 +58,24 @@ pub enum EdgeVerification {
 
 impl EdgeVerification {
     /// Build from the `[network]` settings, reading the CA bundle if configured.
-    pub fn from_config(ca_cert: Option<&str>, pins: &[String]) -> anyhow::Result<Self> {
+    pub fn from_config(
+        ca_cert: Option<&str>,
+        pins: &[String],
+        insecure_skip_verify: bool,
+    ) -> anyhow::Result<Self> {
+        let modes = usize::from(ca_cert.is_some())
+            + usize::from(!pins.is_empty())
+            + usize::from(insecure_skip_verify);
+        if modes != 1 {
+            anyhow::bail!(
+                "configure exactly one of edge_ca_cert, edge_cert_sha256, or insecure_skip_verify"
+            );
+        }
         if let Some(path) = ca_cert {
             let pem =
                 std::fs::read(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
             let mut roots = rustls::RootCertStore::empty();
-            for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+            for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&pem) {
                 roots.add(cert?)?;
             }
             if roots.is_empty() {
@@ -77,7 +90,12 @@ impl EdgeVerification {
                     .collect(),
             ));
         }
-        Ok(EdgeVerification::Skip)
+        if insecure_skip_verify {
+            return Ok(EdgeVerification::Skip);
+        }
+        anyhow::bail!(
+            "Edge certificate verification is required; configure edge_ca_cert or edge_cert_sha256"
+        )
     }
 }
 
@@ -719,14 +737,16 @@ mod tests {
     fn verification_mode_follows_the_configuration() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         assert!(matches!(
-            EdgeVerification::from_config(None, &[]).unwrap(),
+            EdgeVerification::from_config(None, &[], true).unwrap(),
             EdgeVerification::Skip
         ));
         assert!(matches!(
-            EdgeVerification::from_config(None, &["ab".repeat(32)]).unwrap(),
+            EdgeVerification::from_config(None, &["ab".repeat(32)], false).unwrap(),
             EdgeVerification::Pinned(_)
         ));
-        assert!(EdgeVerification::from_config(Some("/nonexistent/ca.pem"), &[]).is_err());
+        assert!(EdgeVerification::from_config(Some("/nonexistent/ca.pem"), &[], false).is_err());
+        assert!(EdgeVerification::from_config(None, &[], false).is_err());
+        assert!(EdgeVerification::from_config(None, &["ab".repeat(32)], true).is_err());
     }
 
     #[test]

@@ -86,7 +86,16 @@ pub fn make_jwt(secret: &str, sub: &str, hostnames: &[&str]) -> String {
         exp: now + 3600,
         iat: now,
     };
+    let secret = normalized_test_secret(secret);
     sign_jwt(&claims, secret.as_bytes()).expect("sign_jwt failed")
+}
+
+fn normalized_test_secret(secret: &str) -> String {
+    if secret.len() >= sievetube_common::auth::MIN_JWT_SECRET_LEN {
+        secret.to_string()
+    } else {
+        format!("{secret}:integration-test-padding-0123456789abcdef")
+    }
 }
 
 /// Edge configuration builder for tests. Ports are allocated on creation.
@@ -114,7 +123,7 @@ impl EdgeTestConfig {
             http_port: find_free_port(),
             https_port: find_free_port(),
             health_port: find_free_port(),
-            jwt_secret: jwt_secret.to_string(),
+            jwt_secret: normalized_test_secret(jwt_secret),
             tcp_listeners: Vec::new(),
             udp_listeners: Vec::new(),
             cert_dir: "/nonexistent/test-certs".to_string(),
@@ -275,13 +284,18 @@ pub fn write_connector_config_with_network(
         .map(|a| format!("\"{a}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    let verification = if network_extra.trim().is_empty() {
+        "insecure_skip_verify = true"
+    } else {
+        network_extra
+    };
     let content = format!(
         r#"[auth]
 token = "{jwt}"
 
 [network]
 public_servers = [{servers}]
-{network_extra}
+{verification}
 {ingress_toml}"#
     );
     std::fs::write(&path, content).expect("write connector config");
@@ -291,11 +305,16 @@ public_servers = [{servers}]
 /// RAII wrapper for a spawned child process. Sends SIGKILL on drop.
 pub struct ProcessGuard {
     child: Child,
+    config_path: PathBuf,
 }
 
 impl ProcessGuard {
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
     }
 
     /// Send a signal (e.g. "HUP", "TERM") to the process.
@@ -347,7 +366,10 @@ fn spawn_binary(name: &str, config_path: &Path, envs: &[(&str, &str)]) -> Proces
         .unwrap_or_else(|e| {
             panic!("failed to spawn {name}: {e}\nRun `cargo build -p sievetube-edge -p sievetube-connector` first.")
         });
-    ProcessGuard { child }
+    ProcessGuard {
+        child,
+        config_path: config_path.to_path_buf(),
+    }
 }
 
 /// Spawn the edge binary with the given config file.
@@ -362,7 +384,13 @@ pub async fn start_edge_with_env(config_path: &Path, envs: &[(&str, &str)]) -> P
 
 /// Spawn the connector binary with the given config file.
 pub async fn start_connector(config_path: &Path) -> ProcessGuard {
-    spawn_binary("sievetube-connector", config_path, &[])
+    // Test binaries run in parallel; let the OS allocate a distinct health port
+    // because these tests observe Connector state through the Edge.
+    spawn_binary(
+        "sievetube-connector",
+        config_path,
+        &[("SIEVETUBE_HEALTH_ADDR", "127.0.0.1:0")],
+    )
 }
 
 /// Poll /healthz on the given port until it returns 200, up to 10 seconds.

@@ -31,12 +31,14 @@ async fn tunnel_established(
     let edge_cfg = edge.write();
 
     let jwt = helpers::make_jwt(secret, &format!("tenant-{secret}"), &[HOST]);
+    let verification = network_extra(&ca, &cert_pem);
+    let network_settings = format!("edge_server_name = \"localhost\"\n{verification}");
     let conn_cfg = helpers::write_connector_config_with_network(
         &jwt,
-        // Connect by name so the certificate's SAN is checked.
-        &[&format!("localhost:{}", edge.quic_port)],
+        // Connect directly to the IPv4 listener while checking the DNS SAN.
+        &[&format!("127.0.0.1:{}", edge.quic_port)],
         &[(HOST, "http", &format!("127.0.0.1:{backend_port}"))],
-        &network_extra(&ca, &cert_pem),
+        &network_settings,
     );
 
     let _edge = helpers::start_edge(&edge_cfg).await;
